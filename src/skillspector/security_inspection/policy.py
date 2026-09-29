@@ -40,7 +40,7 @@ def evaluate_policy(events: list[dict[str, Any]], policy: dict[str, Any]) -> dic
     for e in events:
         # e is finding dict or event dict
         cat = e.get("category", "")
-        sev = e.get("severity", "medium")
+        e.get("severity", "medium")
         tgt = e.get("target") or e.get("file") or ""
         rule = e.get("rule_id", "")
         # network

@@ -159,9 +159,9 @@ def parse_python_imports(skill_path: Path, all_skill_names: set[str]) -> list[st
 
 def build_dependency_graph(root: Path) -> tuple[nx.DiGraph, dict[str, Path]]:
     skills = discover_skills(root)
-    G = nx.DiGraph()
+    graph = nx.DiGraph()
     for name, path in skills.items():
-        G.add_node(name, path=str(path), label=name)
+        graph.add_node(name, path=str(path), label=name)
     all_names = set(skills.keys())
     for name, path in skills.items():
         manifest_deps = parse_manifest_dependencies(path)
@@ -169,20 +169,20 @@ def build_dependency_graph(root: Path) -> tuple[nx.DiGraph, dict[str, Path]]:
         combined = set(manifest_deps + import_deps)
         for dep in combined:
             if dep in all_names:
-                G.add_edge(name, dep, type="depends_on")
+                graph.add_edge(name, dep, type="depends_on")
             else:
                 # external dep (still add as node for visibility)
-                if dep and dep not in G:
-                    G.add_node(dep, path="", label=dep, external=True)
+                if dep and dep not in graph:
+                    graph.add_node(dep, path="", label=dep, external=True)
                 if dep:
-                    G.add_edge(name, dep, type="external")
-    return G, skills
+                    graph.add_edge(name, dep, type="external")
+    return graph, skills
 
 
-def graph_to_cytoscape(G: nx.DiGraph) -> list[dict[str, Any]]:
+def graph_to_cytoscape(graph: nx.DiGraph) -> list[dict[str, Any]]:
     """Convert to cytoscape/visjs friendly JSON."""
     nodes = []
-    for n, data in G.nodes(data=True):
+    for n, data in graph.nodes(data=True):
         nodes.append(
             {
                 "data": {
@@ -193,29 +193,29 @@ def graph_to_cytoscape(G: nx.DiGraph) -> list[dict[str, Any]]:
             }
         )
     edges = []
-    for u, v, data in G.edges(data=True):
+    for u, v, data in graph.edges(data=True):
         edges.append({"data": {"source": u, "target": v, "type": data.get("type", "depends_on")}})
     return {"nodes": nodes, "edges": edges}
 
 
-def detect_cycles(G: nx.DiGraph) -> list[list[str]]:
+def detect_cycles(graph: nx.DiGraph) -> list[list[str]]:
     try:
-        cycles = list(nx.simple_cycles(G))
+        cycles = list(nx.simple_cycles(graph))
         return cycles
     except Exception:
         return []
 
 
-def compute_metrics(G: nx.DiGraph) -> dict[str, Any]:
+def compute_metrics(graph: nx.DiGraph) -> dict[str, Any]:
     return {
-        "num_nodes": G.number_of_nodes(),
-        "num_edges": G.number_of_edges(),
-        "is_dag": nx.is_directed_acyclic_graph(G),
-        "cycles": detect_cycles(G),
-        "isolated": list(nx.isolates(G)),
-        "in_degree": dict(G.in_degree()),
-        "out_degree": dict(G.out_degree()),
-        "most_depended": sorted(G.in_degree(), key=lambda x: x[1], reverse=True)[:5]
-        if G.number_of_nodes()
+        "num_nodes": graph.number_of_nodes(),
+        "num_edges": graph.number_of_edges(),
+        "is_dag": nx.is_directed_acyclic_graph(graph),
+        "cycles": detect_cycles(graph),
+        "isolated": list(nx.isolates(graph)),
+        "in_degree": dict(graph.in_degree()),
+        "out_degree": dict(graph.out_degree()),
+        "most_depended": sorted(graph.in_degree(), key=lambda x: x[1], reverse=True)[:5]
+        if graph.number_of_nodes()
         else [],
     }

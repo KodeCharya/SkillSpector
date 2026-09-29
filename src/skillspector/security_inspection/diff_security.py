@@ -99,7 +99,9 @@ def _difflib_dir_compare(dir_a: Path, dir_b: Path) -> str:
 def analyze_diff_text(diff_text: str) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     added_lines = [
-        l for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++")
+        line
+        for line in diff_text.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
     ]
     added_text = "\n".join(added_lines)
 
@@ -119,7 +121,7 @@ def analyze_diff_text(diff_text: str) -> list[dict[str, Any]]:
                         "message": f"Risky change: new {category.replace('_', ' ')} detected in diff (pattern: {pat})",
                         "file": "diff",
                         "line": None,
-                        "evidence": f"Added line matching {pat}: {next((l for l in added_lines if re.search(pat, l, re.IGNORECASE)), '')[:200]}",
+                        "evidence": f"Added line matching {pat}: {next((line for line in added_lines if re.search(pat, line, re.IGNORECASE)), '')[:200]}",
                         "fix": "Review change for least privilege and security impact",
                     }
                 )
@@ -144,7 +146,9 @@ def analyze_diff_text(diff_text: str) -> list[dict[str, Any]]:
     # New file with executable permission?
     if "Added file:" in diff_text and re.search(r"\.sh|\.py", diff_text):
         # count added files
-        added_files = [l for l in diff_text.splitlines() if l.startswith("+++ Added file:")]
+        added_files = [
+            line for line in diff_text.splitlines() if line.startswith("+++ Added file:")
+        ]
         if len(added_files) > 3:
             findings.append(
                 {
@@ -188,10 +192,18 @@ def compare_skill_versions(
     findings = analyze_diff_text(diff_text)
     stats = {
         "added_lines": len(
-            [l for l in diff_text.splitlines() if l.startswith("+") and not l.startswith("+++")]
+            [
+                line
+                for line in diff_text.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+            ]
         ),
         "removed_lines": len(
-            [l for l in diff_text.splitlines() if l.startswith("-") and not l.startswith("---")]
+            [
+                line
+                for line in diff_text.splitlines()
+                if line.startswith("-") and not line.startswith("---")
+            ]
         ),
         "diff_size": len(diff_text),
     }
@@ -240,8 +252,8 @@ def diff_against_previous_version(
         "diff_text": diff_text,
         "findings": findings,
         "stats": {
-            "added_lines": len([l for l in diff_text.splitlines() if l.startswith("+")]),
-            "removed_lines": len([l for l in diff_text.splitlines() if l.startswith("-")]),
+            "added_lines": len([line for line in diff_text.splitlines() if line.startswith("+")]),
+            "removed_lines": len([line for line in diff_text.splitlines() if line.startswith("-")]),
             "diff_size": len(diff_text),
         },
     }

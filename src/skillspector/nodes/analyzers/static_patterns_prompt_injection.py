@@ -233,10 +233,12 @@ def _p2_pattern_matches(content: str, pattern: str) -> Iterator[re.Match[str]]:
         cursor = line_break.end()
 
 
+_TAG_BLOCK_RE = re.compile(rf"[{chr(_TAG_BLOCK[0])}-{chr(_TAG_BLOCK[1])}]")
+
 def _first_smuggled_tag_offset(content: str) -> int | None:
     """Return the char offset of the first Unicode Tag character that is *not*
     part of a well-formed emoji tag sequence, or ``None`` if there is none."""
-    if not any(_TAG_BLOCK[0] <= ord(ch) <= _TAG_BLOCK[1] for ch in content):
+    if not _TAG_BLOCK_RE.search(content):
         return None
     safe_spans = [(m.start(), m.end()) for m in _EMOJI_TAG_SEQUENCE.finditer(content)]
     for i, ch in enumerate(content):

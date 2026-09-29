@@ -113,3 +113,5 @@ credentials.json
 sync.ffs_db
 *.ffs_db
 
+*.ini
+*.md

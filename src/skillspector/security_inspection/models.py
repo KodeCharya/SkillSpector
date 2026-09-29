@@ -5,11 +5,11 @@ models.py - Dataclasses for findings, skills, manifests.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     CRITICAL = "critical"
     HIGH = "high"
     MEDIUM = "medium"
@@ -17,7 +17,7 @@ class Severity(str, Enum):
     INFO = "info"
 
 
-class Category(str, Enum):
+class Category(StrEnum):
     SECRETS = "secrets"
     PERMISSION = "permission"
     NETWORK = "network"
