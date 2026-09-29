@@ -245,7 +245,7 @@ def run_isolated(skill_path: Path, timeout: float = 10.0) -> EventGraph:
                 skill_lower = str(skill_path).lower()
                 for d in data:
                     tgt = str(d.get("target", "")).lower()
-                    subj = str(d.get("subject", "")).lower()
+                    str(d.get("subject", "")).lower()
                     # Aggressive filter: skip any stdlib/lib reads unless skill-related or sensitive
                     if "lib" in tgt or "site-packages" in tgt or "conda" in tgt:
                         if skill_lower not in tgt:

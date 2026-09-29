@@ -397,11 +397,11 @@ def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFindin
     """Analyze content for anti-refusal statements (AR1-AR3)."""
     findings: list[AnalyzerFinding] = []
     tag = [PatternCategory.ANTI_REFUSAL.value]
+    lines = content.splitlines()
 
     for rule_id, patterns in _RULES:
         for pattern, base_confidence in patterns:
             for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                lines = content.splitlines()
                 line_num = get_line_number(content, match.start())
                 match_line = lines[line_num - 1] if lines else content
                 previous_line = lines[line_num - 2] if line_num > 1 else None

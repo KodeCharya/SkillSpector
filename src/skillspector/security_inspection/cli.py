@@ -264,7 +264,9 @@ def main():
         if report_server.exists():
             txt = report_server.read_text(encoding="utf-8", errors="ignore")
             # Only flag if actual binding code uses 0.0.0.0, not docstring "no 0.0.0.0"
-            code_only = "\n".join(line for line in txt.splitlines() if "no 0.0.0.0" not in line.lower())
+            code_only = "\n".join(
+                line for line in txt.splitlines() if "no 0.0.0.0" not in line.lower()
+            )
             if '"0.0.0.0"' in code_only or "'0.0.0.0'" in code_only:
                 # check if it's a host binding (not just a comment)
                 if re.search(r'host\s*=\s*["\']0\.0\.0\.0["\']', code_only):
