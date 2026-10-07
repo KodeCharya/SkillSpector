@@ -234,7 +234,6 @@ def analyze(state: SkillspectorState) -> list[Finding]:
     return findings
 
 
-def node(state: SkillspectorState) -> AnalyzerNodeResponse:
-    """Analyzer node entry point for LangGraph."""
-    findings = analyze(state)
-    return {"findings": findings}
+# Opt-in tool: not auto-registered into default workflow graph.
+# Run via dedicated CLI commands (e.g. offline-scan).
+node = None
