@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+
 from skillspector.security_inspection.report_server import create_app_for_testing
 
 
@@ -32,10 +33,21 @@ def test_report_html_xss_escaping() -> None:
             "avg_score": 85,
             "grade": "B",
         },
-        "graph_metrics": {"total_nodes": 1, "total_edges": 1, "cyclomatic_complexity": 0, "is_dag": True, "cycles": []},
+        "graph_metrics": {
+            "total_nodes": 1,
+            "total_edges": 1,
+            "cyclomatic_complexity": 0,
+            "is_dag": True,
+            "cycles": [],
+        },
         "graph": {
             "nodes": [
-                {"data": {"id": "</script><script>alert(1)</script>", "label": '<img src=x onerror="alert(2)">'}}
+                {
+                    "data": {
+                        "id": "</script><script>alert(1)</script>",
+                        "label": '<img src=x onerror="alert(2)">',
+                    }
+                }
             ],
             "edges": [
                 {

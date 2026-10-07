@@ -49,7 +49,7 @@ def _parse_requirements(skill_path: Path) -> list[dict[str, str]]:
                         )
             elif rf.name == "pyproject.toml":
                 # naive parse
-                for m in re.finditer(r'"([A-Za-z0-9_\-\.]+)"\s*=\s*"([^"]+)"', text):
+                for _m in re.finditer(r'"([A-Za-z0-9_\-\.]+)"\s*=\s*"([^"]+)"', text):
                     # dependencies = ["requests>=2.0"] etc - fallback
                     pass
                 # look for dependencies = [
@@ -109,7 +109,7 @@ def generate_sbom(skill_path: Path, skills_root: Path) -> dict[str, Any]:
 
     components: list[dict[str, Any]] = []
     # main skill component
-    skill_hash = (
+    (
         _hash_file(skill_path / "skill.json")
         or _hash_file(skill_path / "manifest.json")
         or hashlib.sha256(skill_name.encode()).hexdigest()[:16]

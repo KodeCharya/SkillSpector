@@ -48,9 +48,9 @@ class SecurityScanner:
     ) -> dict[str, Any]:
         scan_id = f"scan-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         # Dependency graph
-        G, discovered = build_dependency_graph(self.skills_root)
-        graph_json = graph_to_cytoscape(G)
-        metrics = compute_metrics(G)
+        graph, discovered = build_dependency_graph(self.skills_root)
+        graph_json = graph_to_cytoscape(graph)
+        metrics = compute_metrics(graph)
 
         skills_results: list[dict[str, Any]] = []
         aggregate_sbom = generate_aggregate_sbom(self.skills_root, discovered)
@@ -202,7 +202,7 @@ class SecurityScanner:
 
             # Correlation (per-skill)
             # Add all current findings as events for correlation
-            for f in findings:
+            for _f in findings:
                 # Avoid duplicating drift/secrets already added, but add generic
                 pass
             corr_findings = correlate(events)
@@ -332,5 +332,4 @@ class SecurityScanner:
 
     def scan_single(self, skill_path: Path) -> dict[str, Any]:
         # Convenience: scan containing directory as root
-        root = skill_path.parent if skill_path.parent != self.skills_root else self.skills_root
         return self.scan()

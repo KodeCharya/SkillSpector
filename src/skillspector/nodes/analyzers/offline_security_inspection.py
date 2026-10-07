@@ -21,7 +21,7 @@ from typing import Any
 
 from skillspector.logging_config import get_logger
 from skillspector.models import Finding, Severity
-from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+from skillspector.state import SkillspectorState
 
 logger = get_logger(__name__)
 

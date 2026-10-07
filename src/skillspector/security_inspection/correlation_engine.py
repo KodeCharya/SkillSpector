@@ -50,7 +50,7 @@ ATTACK_TEMPLATES = [
 def correlate(graph: EventGraph) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     # Group events by capability order
-    caps = [e.capability for e in graph.events]
+    [e.capability for e in graph.events]
     # Also consider category+action as capability
     for tmpl in ATTACK_TEMPLATES:
         seq = tmpl["sequence"]

@@ -136,8 +136,8 @@ def generate_recommendations(
     provenance: dict[str, Any] = None,
 ) -> list[str]:
     recs: list[str] = []
-    cats = set(f.get("category") for f in findings)
-    sevs = set(f.get("severity") for f in findings)
+    cats = {f.get("category") for f in findings}
+    sevs = {f.get("severity") for f in findings}
     if "secrets" in cats:
         recs.append("Remove hardcoded credentials; use environment variables or vault")
     if "permission" in cats:

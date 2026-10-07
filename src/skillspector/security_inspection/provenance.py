@@ -118,12 +118,12 @@ def record_provenance(
     history = get_provenance_history(meta["name"], db_path=db_path)
     findings: list[dict[str, Any]] = []
     if len(history) > 1:
-        hashes = set(r["hash_sha256"] for r in history)
+        hashes = {r["hash_sha256"] for r in history}
         if len(hashes) > 1 and history[0]["hash_sha256"] != sha:
             # Actually current not yet in history? We just saved, so check prior
             pass
         # Check for author change - potential hijack
-        authors = set(r["author"] for r in history)
+        authors = {r["author"] for r in history}
         if len(authors) > 1:
             findings.append(
                 {
