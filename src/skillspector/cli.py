@@ -2634,12 +2634,14 @@ def offline_scan(
 ) -> None:
     """Run standalone offline security inspection (no cloud, no LLM, deterministic)."""
     try:
+        from pathlib import Path as _P
+
         from skillspector.security_inspection.report_server import serve as _serve
         from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] Offline plugin not available: {e}")
         raise typer.Exit(code=2) from e
-    p = Path(input_path).resolve()
+    p = _P(input_path).resolve()
     if not p.exists():
         err_console.print(f"[red]Error:[/red] Path not found: {p}")
         raise typer.Exit(code=2)
@@ -2679,12 +2681,14 @@ def policy_check(
 ) -> None:
     """Policy-as-Code check: skillspector policy check <skill> --policy policy.yaml"""
     try:
+        from pathlib import Path as _P
+
         from skillspector.security_inspection.policy import evaluate_policy, load_policy
         from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
-    p = Path(input_path).resolve()
+    p = _P(input_path).resolve()
     if not p.exists():
         err_console.print(f"[red]Error:[/red] Path not found: {p}")
         raise typer.Exit(code=2)
@@ -2712,23 +2716,26 @@ def security_diff(
 ) -> None:
     """Security Regression Engine: skillspector security-diff old/ new/"""
     try:
+        import json as _json
+        from pathlib import Path as _P
+
         from skillspector.security_inspection.regression import compare_reports
         from skillspector.security_inspection.scanner import SecurityScanner
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
 
-    def load_report(path: str) -> dict[str, cast(type, object)]:
-        p = Path(path)
+    def load_report(path: str) -> Dict[str, Any]:
+        p = _P(path)
         if p.is_file() and p.suffix == ".json":
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
+                data = _json.loads(p.read_text(encoding="utf-8"))
                 if "scan_id" in data or "skills" in data:
                     return data
             except Exception:
                 pass
         # treat as skill path, scan
-        scanner = SecurityScanner(Path(path))
+        scanner = SecurityScanner(_P(path))
         return scanner.scan()
 
     old = load_report(old_path)
@@ -2755,11 +2762,14 @@ def runtime_scan(
 ) -> None:
     """Runtime Behavior Monitor (highest priority): isolated execution + collectors."""
     try:
+        import json as _json
+        from pathlib import Path as _P
+
         from skillspector.security_inspection.runtime_monitor import run_isolated
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
-    p = Path(input_path).resolve()
+    p = _P(input_path).resolve()
     if not p.exists():
         err_console.print(f"[red]Error:[/red] Path not found: {p}")
         raise typer.Exit(code=2)
