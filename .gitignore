@@ -113,5 +113,7 @@ credentials.json
 sync.ffs_db
 *.ffs_db
 
-*.ini
-*.md
+# Reports (generated artifacts only — anchored to repo root)
+/report*.md
+/report*.json
+/report*.sarif

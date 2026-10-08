@@ -215,8 +215,8 @@
 </section>
 </main>
 <footer>Local report served on <code>http://127.0.0.1</code> only — no cloud, no telemetry, no LLM. Stored under <code>~/.skill-inspector/</code> (SQLite).</footer>
-<script id="graph-data" type="application/json">{{ graph_json | safe }}</script>
-<script id="skills-data" type="application/json">{{ skills_json | safe }}</script>
+<script id="graph-data" type="application/json">{{ graph | tojson }}</script>
+<script id="skills-data" type="application/json">{{ skills | tojson }}</script>
 <script src="/static/js/graph.js"></script>
 <script>
 // Tabs
@@ -275,7 +275,14 @@ try{
   const tbody=document.querySelector('#graph-edges tbody');
   if(tbody){
     if(!g.edges || !g.edges.length){ document.getElementById('graph-empty').style.display='block'; }
-    else g.edges.forEach(e=>{ const tr=document.createElement('tr'); tr.innerHTML=`<td>${e.data.source}</td><td>${e.data.target}</td><td>${e.data.type}</td>`; tbody.appendChild(tr); });
+    else g.edges.forEach(e=>{
+      const tr=document.createElement('tr');
+      const td1=document.createElement('td'); td1.textContent=e.data.source;
+      const td2=document.createElement('td'); td2.textContent=e.data.target;
+      const td3=document.createElement('td'); td3.textContent=e.data.type;
+      tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3);
+      tbody.appendChild(tr);
+    });
   }
 }catch(e){}
 </script>

