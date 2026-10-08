@@ -17,11 +17,11 @@
 
 import warnings
 from importlib.metadata import version as _pkg_version
+from typing import Any
 
-try:
-    __version__ = _pkg_version("skillspector")
-except Exception:
-    __version__ = "2.11.1"
+from skillspector.graph_proxy import graph, restore_package_graph_export
+
+__version__ = _pkg_version("skillspector")
 
 # ponytail: langgraph deserializes with langchain's allowed_objects default,
 # which warns. langchain_core's import re-enables that warning via
@@ -35,10 +35,18 @@ warnings.filterwarnings(
     category=Warning,
 )
 
-try:
-    from skillspector.graph import create_graph, graph  # noqa: E402 (after filter setup)
-except Exception as _e:
-    create_graph = None  # type: ignore
-    graph = None  # type: ignore
+
+def create_graph() -> Any:
+    """Build and return a new SkillSpector workflow graph."""
+    from skillspector.graph import create_graph as build_graph
+
+    try:
+        return build_graph()
+    finally:
+        # Importing the submodule shadows the lazy proxy on the package;
+        # restore the documented export even when this factory is the first
+        # graph access.
+        restore_package_graph_export()
+
 
 __all__ = ["create_graph", "graph", "__version__"]

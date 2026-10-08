@@ -1,13 +1,12 @@
 """
 diff_security.py - Compare skill versions and flag risky changes.
-Uses Git plumbing if available, else difflib (offline, deterministic).
+Uses in-process difflib only (offline, deterministic, safe against hostile .git/config).
 """
 
 from __future__ import annotations
 
 import difflib
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -20,46 +19,8 @@ RISKY_CHANGE_PATTERNS = {
 }
 
 
-def _git_diff(skill_path: Path, ref_a: str, ref_b: str) -> str | None:
-    """Try git diff using plumbing, returns None if not git repo."""
-    try:
-        # find git root
-        cur = skill_path.resolve()
-        git_root = None
-        for parent in [cur] + list(cur.parents):
-            if (parent / ".git").exists():
-                git_root = parent
-                break
-        if not git_root:
-            return None
-        # Use git plumbing: git diff --no-color ref_a..ref_b -- <path>
-        # Only if refs are valid commits/tags
-        rel = skill_path.relative_to(git_root) if skill_path != git_root else Path(".")
-        cmd = [
-            "git",
-            "-C",
-            str(git_root),
-            "diff",
-            "--no-color",
-            f"{ref_a}..{ref_b}",
-            "--",
-            str(rel),
-        ]
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if out.returncode == 0:
-            return out.stdout
-        # fallback: git diff HEAD
-        cmd2 = ["git", "-C", str(git_root), "diff", "--no-color", "--", str(rel)]
-        out2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=10)
-        if out2.returncode == 0 and out2.stdout.strip():
-            return out2.stdout
-        return None
-    except Exception:
-        return None
-
-
 def _difflib_dir_compare(dir_a: Path, dir_b: Path) -> str:
-    """Fallback difflib directory comparison."""
+    """In-process difflib directory comparison."""
     # collect files
     files_a = {
         str(p.relative_to(dir_a)): p
@@ -169,24 +130,19 @@ def compare_skill_versions(
     skill_path_a: Path, skill_path_b: Path, ref_a: str = "a", ref_b: str = "b"
 ) -> dict[str, Any]:
     """
-    Compare two skill directories (or git refs). If git available, prefer git plumbing.
+    Compare two skill directories in-process using difflib.
+    Never run git on scanned content to prevent executing repository-local hooks/config.
     Returns {diff_text, findings, stats}
     """
-    diff_text: str | None = None
-    # if paths are same but refs differ, try git
-    if skill_path_a == skill_path_b:
-        diff_text = _git_diff(skill_path_a, ref_a, ref_b)
-    if diff_text is None:
-        # if different dirs, do difflib compare
-        if skill_path_a != skill_path_b and skill_path_a.exists() and skill_path_b.exists():
+    diff_text = ""
+    try:
+        if (
+            skill_path_a.exists()
+            and skill_path_b.exists()
+            and skill_path_a.resolve() != skill_path_b.resolve()
+        ):
             diff_text = _difflib_dir_compare(skill_path_a, skill_path_b)
-        elif skill_path_a.exists() and skill_path_b == skill_path_a:
-            # no diff
-            diff_text = ""
-        else:
-            diff_text = _git_diff(skill_path_a, ref_a, ref_b) or ""
-
-    if diff_text is None:
+    except Exception:
         diff_text = ""
 
     findings = analyze_diff_text(diff_text)
@@ -213,47 +169,18 @@ def compare_skill_versions(
 def diff_against_previous_version(
     skill_path: Path, previous_snapshot: Path | None = None
 ) -> dict[str, Any]:
-    """Compare current skill against previous snapshot if provided; else try git diff."""
+    """Compare current skill against an explicit snapshot in-process if provided.
+
+    Never invokes git on scanned content.
+    """
     if previous_snapshot and previous_snapshot.exists():
         return compare_skill_versions(previous_snapshot, skill_path)
-    # Try git diff HEAD
-    diff_text = _git_diff(skill_path, "HEAD", "HEAD")  # will fallback to working tree diff
-    if not diff_text:
-        # Try git diff vs last commit file list
-        try:
-            cur = skill_path.resolve()
-            git_root = None
-            for parent in [cur] + list(cur.parents):
-                if (parent / ".git").exists():
-                    git_root = parent
-                    break
-            if git_root:
-                out = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(git_root),
-                        "diff",
-                        "--no-color",
-                        "--",
-                        str(skill_path.relative_to(git_root)),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                diff_text = out.stdout
-        except Exception:
-            diff_text = ""
-    if not diff_text:
-        diff_text = ""
-    findings = analyze_diff_text(diff_text) if diff_text else []
     return {
-        "diff_text": diff_text,
-        "findings": findings,
+        "diff_text": "",
+        "findings": [],
         "stats": {
-            "added_lines": len([line for line in diff_text.splitlines() if line.startswith("+")]),
-            "removed_lines": len([line for line in diff_text.splitlines() if line.startswith("-")]),
-            "diff_size": len(diff_text),
+            "added_lines": 0,
+            "removed_lines": 0,
+            "diff_size": 0,
         },
     }
