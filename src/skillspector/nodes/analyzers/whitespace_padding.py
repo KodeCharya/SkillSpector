@@ -435,14 +435,16 @@ def _detect_block_and_ratio(content: str) -> list[PaddingRun]:
     # Whitespace-to-file ratio (bytes) for files over the floor.
     file_bytes = len(content.encode("utf-8"))
     if file_bytes > RATIO_MIN_FILE_BYTES:
-                # Fast path for spaces
+        # Fast path for spaces
         spaces = content.count(" ")
         newlines = content.count("\n")
         carriage = content.count("\r")
         tabs = content.count("\t")
         fast_bytes = spaces + newlines + carriage + tabs
         remaining = content.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
-        padding_bytes = fast_bytes + sum(len(ch.encode("utf-8")) for ch in remaining if is_padding_char(ch))
+        padding_bytes = fast_bytes + sum(
+            len(ch.encode("utf-8")) for ch in remaining if is_padding_char(ch)
+        )
         if file_bytes and padding_bytes / file_bytes > RATIO_THRESHOLD:
             runs.append(
                 PaddingRun(
@@ -461,13 +463,14 @@ def _detect_repetition(content: str) -> list[PaddingRun]:
     """Detect non-whitespace character and line repetition used as visual padding."""
     runs: list[PaddingRun] = []
     import re
+
     for match in re.finditer(r"(.)\1{511,}", content, re.DOTALL):
         if not is_padding_char(match.group(1)):
             runs.append(
                 PaddingRun(
                     kind="repetition",
                     start_offset=match.start(),
-                    start_line=content[:match.start()].count("\n") + 1,
+                    start_line=content[: match.start()].count("\n") + 1,
                     length=match.end() - match.start(),
                     followed_by_content=match.end() < len(content),
                     summary=f"repeated U+{ord(match.group(1)):04X} x{match.end() - match.start()}",
