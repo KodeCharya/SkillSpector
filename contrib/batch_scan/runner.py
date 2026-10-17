@@ -37,8 +37,14 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from skillspector.graph import graph
-from skillspector.llm_analyzer_base import LLMAnalysisResult, LLMAnalyzerBase
+from skillspector.llm_analyzer_base import (
+    LLMAnalyzerBase,
+    LLMAnalysisResult,
+    _StructuredResponseValidationError,
+)
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
 
@@ -52,12 +58,12 @@ logger = get_logger(__name__)
 # API Key Pool — shared across graph-internal and gap-fill LLM calls
 # ═══════════════════════════════════════════════════════════════════════════
 
-_api_pool: ApiKeyPool | None = None
+_api_pool: "ApiKeyPool | None" = None
 
 _original_get_chat_model = None  # saved on first set_api_pool call
 
 
-def set_api_pool(pool: ApiKeyPool | None) -> None:
+def set_api_pool(pool: "ApiKeyPool | None") -> None:
     """Replace the LLM chat-model factory with a pooled version.
 
     When *pool* is set, every call to :func:`skillspector.llm_utils.get_chat_model`
@@ -69,8 +75,8 @@ def set_api_pool(pool: ApiKeyPool | None) -> None:
     """
     global _api_pool, _original_get_chat_model
 
-    import skillspector.llm_analyzer_base as _llm_analyzer_base
     import skillspector.llm_utils as _llm_utils
+    import skillspector.llm_analyzer_base as _llm_analyzer_base
 
     if pool is None:
         _api_pool = None
@@ -85,26 +91,27 @@ def set_api_pool(pool: ApiKeyPool | None) -> None:
     if _original_get_chat_model is None:
         _original_get_chat_model = _llm_utils.get_chat_model
 
-    def _pooled_get_chat_model(model=None):
+    def _pooled_get_chat_model(model=None, *, timeout=None):
         if _api_pool:
             from .api_pool import PooledChatModel
-
-            pooled_model = PooledChatModel(_api_pool)
+            pooled_model = PooledChatModel(
+                _api_pool,
+                timeout=_DEFAULT_REQUEST_TIMEOUT if timeout is None else timeout,
+            )
             _llm_utils.register_chat_model_provider(pooled_model, "openai")
             return pooled_model
-        return _original_get_chat_model(model)
+        return _original_get_chat_model(model=model, timeout=timeout)
 
     _llm_utils.get_chat_model = _pooled_get_chat_model
     _llm_analyzer_base.get_chat_model = _pooled_get_chat_model
     logger.info("API key pool wired — all LLM calls will use PooledChatModel")
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HTTP timeout — stop hung connections from blocking workers forever
 # ═══════════════════════════════════════════════════════════════════════════
 
 _DEFAULT_REQUEST_TIMEOUT = 30.0  # total request ceiling
-_DEFAULT_CONNECT_TIMEOUT = 8.0  # TCP / TLS handshake
+_DEFAULT_CONNECT_TIMEOUT = 8.0   # TCP / TLS handshake
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Compatibility patches (DeepSeek / non-OpenAI providers)
@@ -126,7 +133,7 @@ _patches_depth: int = 0  # nesting counter — safe for re-entrant context manag
 _original_base_init = LLMAnalyzerBase.__init__
 
 
-def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
+def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer", timeout=None):
     """Set response_schema=None on the instance dict BEFORE original init.
 
     Relies on Python MRO guarantee: instance.__dict__ is always checked
@@ -134,7 +141,7 @@ def _patched_base_init(self, base_prompt, model, *, node="llm_analyzer"):
     a library internal.
     """
     self.response_schema = None
-    _original_base_init(self, base_prompt, model, node=node)
+    _original_base_init(self, base_prompt, model, node=node, timeout=timeout)
 
 
 # -- Patch 2: LLMAnalyzerBase.parse_response handles raw JSON --------------
@@ -148,23 +155,11 @@ def _patched_base_parse(self, response, batch):
     text = _strip_markdown_fences(str(response))
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "LLMAnalyzerBase.parse_response: invalid JSON for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
-    try:
         result = LLMAnalysisResult.model_validate(data)
-        return [f.to_finding(batch.file_path) for f in result.findings]
-    except Exception as exc:
-        logger.warning(
-            "LLMAnalyzerBase.parse_response: schema validation failed for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
+    except (json.JSONDecodeError, ValidationError) as exc:
+        # Keep raw-response providers on the core retry and failure-ledger path.
+        raise _StructuredResponseValidationError from exc
+    return [f.to_finding(batch.file_path) for f in result.findings]
 
 
 # -- Patch 3: LLMMetaAnalyzer.parse_response handles raw JSON ---------------
@@ -176,7 +171,9 @@ def _sanitize_meta_finding(d: dict) -> dict:
     for key in ("remediation", "explanation"):
         if d.get(key) is None:
             d[key] = ""
-    if d.get("impact") not in ("critical", "high", "medium", "low"):
+    impact = d.get("impact")
+    d["impact"] = impact.casefold() if isinstance(impact, str) else "low"
+    if d["impact"] not in ("critical", "high", "medium", "low"):
         d["impact"] = "low"
     return d
 
@@ -188,28 +185,20 @@ def _patched_meta_parse(self, response, batch):
     text = _strip_markdown_fences(str(response))
     try:
         data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning(
-            "LLMMetaAnalyzer.parse_response: invalid JSON for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
-    try:
+        if isinstance(data, dict) and isinstance(data.get("findings"), list):
+            data["findings"] = [
+                _sanitize_meta_finding(dict(item)) if isinstance(item, dict) else item
+                for item in data["findings"]
+            ]
         result = MetaAnalyzerResult.model_validate(data)
-        items = []
-        for f in result.findings:
-            d = _sanitize_meta_finding(f.model_dump())
-            d["_file"] = batch.file_path
-            items.append(d)
-        return items
-    except Exception as exc:
-        logger.warning(
-            "LLMMetaAnalyzer.parse_response: schema validation failed for %s: %s",
-            batch.file_label,
-            exc,
-        )
-        return []
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise _StructuredResponseValidationError from exc
+    items = []
+    for f in result.findings:
+        d = f.model_dump()
+        d["_file"] = batch.file_path
+        items.append(d)
+    return items
 
 
 # -- Patch 4: append JSON output format to base prompt ---------------------
@@ -219,7 +208,7 @@ _JSON_OUTPUT_INSTRUCTION = (
     '"severity": "LOW|MEDIUM|HIGH|CRITICAL", "start_line": 1, '
     '"end_line": null, "confidence": 0.0-1.0, '
     '"explanation": "...", "remediation": "..."}]}\n'
-    'If no issues found, return: {"findings": []}'
+    "If no issues found, return: {\"findings\": []}"
 )
 
 _original_base_build_prompt = LLMAnalyzerBase.build_prompt
@@ -258,7 +247,6 @@ def _patched_meta_build_prompt(self, batch, **kwargs):
 # patches ChatOpenAI would corrupt the capture inside _apply_patches).
 try:
     from langchain_openai import ChatOpenAI as _CO_for_original
-
     _original_chatopenai_init = _CO_for_original.__init__
 except ImportError:
     _original_chatopenai_init = None
@@ -267,10 +255,14 @@ except ImportError:
 def _patched_chatopenai_init(self, **kwargs):
     import httpx
 
-    _to = httpx.Timeout(
-        _DEFAULT_REQUEST_TIMEOUT,
-        connect=_DEFAULT_CONNECT_TIMEOUT,
-    )
+    requested = kwargs.get("request_timeout", kwargs.get("timeout"))
+    _to = httpx.Timeout(_DEFAULT_REQUEST_TIMEOUT, connect=_DEFAULT_CONNECT_TIMEOUT)
+    if requested is not None:
+        requested = httpx.Timeout(requested).as_dict()
+        _to = httpx.Timeout(**{
+            key: min(cap, requested[key]) if requested[key] is not None else cap
+            for key, cap in _to.as_dict().items()
+        })
     # Set both the Pydantic alias AND the canonical field name so we don't
     # depend on alias-precedence behaviour (which is a Pydantic v2 internal).
     kwargs["timeout"] = _to
@@ -287,16 +279,13 @@ _original_asyncio_run = _asyncio.run
 def _patched_asyncio_run(main, *, debug=None, loop_factory=None):
     def _make_quiet_loop():
         loop = (loop_factory or _asyncio.new_event_loop)()
-
         def _handler(loop, context):
             exc = context.get("exception")
             if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
                 return
             loop.default_exception_handler(context)
-
         loop.set_exception_handler(_handler)
         return loop
-
     return _original_asyncio_run(main, debug=debug, loop_factory=_make_quiet_loop)
 
 
@@ -333,12 +322,13 @@ def _verify_patch_targets() -> None:
         "LLMAnalyzerBase.__init__",
         1,
     )
-    _node_param = inspect.signature(LLMAnalyzerBase.__init__).parameters.get("node")
-    if _node_param is None or _node_param.kind != inspect.Parameter.KEYWORD_ONLY:
-        raise RuntimeError(
-            "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
-            "keyword-only 'node' parameter."
-        )
+    for name in ("node", "timeout"):
+        parameter = inspect.signature(LLMAnalyzerBase.__init__).parameters.get(name)
+        if parameter is None or parameter.kind != inspect.Parameter.KEYWORD_ONLY:
+            raise RuntimeError(
+                "Patch 1 target changed: LLMAnalyzerBase.__init__ must retain its "
+                f"keyword-only '{name}' parameter."
+            )
     if not hasattr(LLMAnalyzerBase, "response_schema"):
         raise RuntimeError(
             "Patch 1 target lost: LLMAnalyzerBase no longer has "
@@ -353,7 +343,7 @@ def _verify_patch_targets() -> None:
         "LLMAnalyzerBase.parse_response",
         2,
     )
-    # Deep deps (called inside try/except — silent degradation if broken):
+    # Validate dependencies before patching rather than failing during a scan:
     if not hasattr(LLMAnalysisResult, "model_validate"):
         raise RuntimeError(
             "Patch 2 deep dependency lost: LLMAnalysisResult.model_validate "
@@ -427,7 +417,9 @@ def _verify_patch_targets() -> None:
         from langchain_openai import ChatOpenAI as _ChatOpenAI
 
         sig6 = inspect.signature(_ChatOpenAI.__init__)
-        if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig6.parameters.values()):
+        if not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig6.parameters.values()
+        ):
             raise RuntimeError(
                 "Patch 6 target changed: ChatOpenAI.__init__ no longer "
                 "accepts **kwargs.  Upstream may have removed the Pydantic "
@@ -545,7 +537,6 @@ def _restore_patches() -> None:
     if _original_chatopenai_init is not None:
         try:
             from langchain_openai import ChatOpenAI as _ChatOpenAI
-
             _ChatOpenAI.__init__ = _original_chatopenai_init
         except ImportError:
             pass
@@ -600,7 +591,7 @@ def _strip_markdown_fences(text: str) -> str:
     if text.startswith("```"):
         nl = text.find("\n")
         if nl != -1:
-            text = text[nl + 1 :]
+            text = text[nl + 1:]
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3].rstrip()
     return text.strip()
@@ -663,7 +654,9 @@ def entry_from_result(
     findings = result.get("filtered_findings", result.get("findings", []))
     manifest = result.get("manifest") or {}
     component_metadata = result.get("component_metadata") or []
-    skill_name = (manifest.get("name") or skill_dir.name) if manifest else skill_dir.name
+    skill_name = (
+        (manifest.get("name") or skill_dir.name) if manifest else skill_dir.name
+    )
 
     try:
         rel_path = str(skill_dir.relative_to(root))
@@ -694,7 +687,9 @@ def entry_from_result(
         "risk_assessment": {
             "score": result.get("risk_score", 0),
             "severity": result.get("risk_severity", "LOW"),
-            "recommendation": (result.get("risk_recommendation") or "SAFE").replace("_", " "),
+            "recommendation": (result.get("risk_recommendation") or "SAFE").replace(
+                "_", " "
+            ),
         },
         "components": [
             {
@@ -713,7 +708,9 @@ def entry_from_result(
         "enhancements": {
             "gap_fill_applied": gap_fill_applied,
             "gap_fill_findings": gap_fill_findings,
-            "english_keyword_rules_skipped": (_ENGLISH_KEYWORD_RULE_COUNT if is_non_en else 0),
+            "english_keyword_rules_skipped": (
+                _ENGLISH_KEYWORD_RULE_COUNT if is_non_en else 0
+            ),
         },
     }
 
