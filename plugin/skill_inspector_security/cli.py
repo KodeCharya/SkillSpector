@@ -144,11 +144,18 @@ def main():
         )
 
     elif args.cmd == "runtime":
-        from .runtime_monitor import run_isolated
+        from .runtime_monitor import RuntimeMonitoringUnavailableError, run_isolated
 
         rp = Path(args.path)
         out = Path(args.output) if args.output else None
-        graph = run_isolated(rp, timeout=float(args.timeout))
+        try:
+            graph = run_isolated(rp, timeout=float(args.timeout))
+        except RuntimeMonitoringUnavailableError as e:
+            print(f"[Runtime Error] {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"[Runtime Error] Runtime scan failed: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"[Runtime] {len(graph.events)} events for {rp}")
         for e in graph.events[:10]:
             print(

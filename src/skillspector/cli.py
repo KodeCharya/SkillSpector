@@ -3625,6 +3625,10 @@ def offline_scan(
         raise typer.Exit(code=2)
     scanner = SecurityScanner(p)
     result = scanner.scan(enable_runtime=enable_runtime)
+    if enable_runtime:
+        runtime_err = result.get("runtime_error")
+        if runtime_err:
+            err_console.print(f"[yellow]Warning:[/yellow] {runtime_err}")
     console.print(
         f"[green]Offline scan complete:[/green] {result['scan_id']} | Skills={result['summary']['total_skills']} Findings={result['summary']['total_findings']} AvgScore={result['summary']['avg_score']}"
     )
@@ -3743,7 +3747,10 @@ def runtime_scan(
         import json
         from pathlib import Path
 
-        from skillspector.security_inspection.runtime_monitor import run_isolated
+        from skillspector.security_inspection.runtime_monitor import (
+            RuntimeMonitoringUnavailableError,
+            run_isolated,
+        )
     except ImportError as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=2) from e
@@ -3751,7 +3758,15 @@ def runtime_scan(
     if not p.exists():
         err_console.print(f"[red]Error:[/red] Path not found: {p}")
         raise typer.Exit(code=2)
-    graph = run_isolated(p, timeout=float(timeout))
+    try:
+        graph = run_isolated(p, timeout=float(timeout))
+    except RuntimeMonitoringUnavailableError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1) from e
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] Runtime scan failed: {e}")
+        raise typer.Exit(code=1) from e
+
     console.print(f"[green]Runtime events:[/green] {len(graph.events)}")
     for e in graph.events[:10]:
         console.print(

@@ -22,29 +22,52 @@ SKILL_MANIFEST_NAMES = [
     "manifest.yaml",
     "manifest.yml",
     "SKILL.md",
+    "skill.md",
     "skill.yaml",
     "skill.yml",
 ]
 IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z0-9_\.]+)")
 
 
+def _has_skill_manifest(path: Path) -> bool:
+    """Return True if path is a directory containing a valid skill manifest."""
+    if not path.is_dir():
+        return False
+    return any((path / m).exists() for m in SKILL_MANIFEST_NAMES)
+
+
 def discover_skills(root: Path) -> Dict[str, Path]:
-    """Each immediate subdirectory with at least one manifest or .py is a skill."""
+    """Discover skill directories under root using deterministic traversal.
+
+    A directory is classified as a skill if and only if it contains a valid skill manifest.
+    - If root itself contains a manifest, root is returned as the single skill.
+    - Otherwise, immediate subdirectories containing manifests are discovered.
+    - If an immediate subdirectory does not contain a manifest, its child directories
+      are checked for manifests (supporting nested repository layouts such as skills/*).
+    - Subdirectories without manifests (e.g. scripts/, docs/) are never classified as skills.
+    """
     skills: Dict[str, Path] = {}
-    if not root.exists():
+    if not root.exists() or not root.is_dir():
         return skills
-    for child in root.iterdir():
-        if child.is_dir():
-            # check if looks like skill
-            has_manifest = any((child / m).exists() for m in SKILL_MANIFEST_NAMES)
-            has_py = any(child.rglob("*.py"))
-            has_md = (child / "SKILL.md").exists() or (child / "README.md").exists()
-            if has_manifest or has_py or has_md:
-                skills[child.name] = child
-    # if root itself is a skill (single skill repo)
-    if not skills and root.is_dir():
-        if any((root / m).exists() for m in SKILL_MANIFEST_NAMES) or any(root.glob("*.py")):
-            skills[root.name] = root
+
+    # If root itself is a skill (single skill repository/directory)
+    if _has_skill_manifest(root):
+        skills[root.name] = root
+        return skills
+
+    # Multi-skill container: check child directories in deterministic order
+    for child in sorted(root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir() or child.name.startswith((".", "__")):
+            continue
+        if _has_skill_manifest(child):
+            skills[child.name] = child
+        else:
+            # Check nested subdirectories (e.g. category/skill or skills/skill)
+            for subchild in sorted(child.iterdir(), key=lambda p: p.name):
+                if subchild.is_dir() and not subchild.name.startswith((".", "__")):
+                    if _has_skill_manifest(subchild):
+                        skills[subchild.name] = subchild
+
     return skills
 
 

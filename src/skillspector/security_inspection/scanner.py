@@ -5,6 +5,7 @@ scanner.py - Orchestrator: runs all analyzers deterministically, stores results.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,8 @@ from .sbom import generate_aggregate_sbom, generate_sbom, save_sbom
 from .scorecard import compute_scorecard
 from .secrets_analyzer import scan_skill_secrets
 from .storage import init_db, save_scan
+
+logger = logging.getLogger(__name__)
 
 
 class SecurityScanner:
@@ -60,6 +63,7 @@ class SecurityScanner:
         # Global event graph for correlation
         global_graph = EventGraph()
         policy = load_policy(policy_path) if policy_path else None
+        last_runtime_error: str | None = None
 
         for name, skill_path in sorted(discovered.items()):
             findings: list[dict[str, Any]] = []
@@ -181,8 +185,10 @@ class SecurityScanner:
                             if e.severity in ("high", "critical")
                         ]
                     )
-                except Exception:
+                except Exception as e:
                     runtime_caps = {}
+                    last_runtime_error = str(e)
+                    logger.warning("Runtime monitoring unavailable or failed for %s: %s", name, e)
 
             # Drift analysis: declared vs static vs runtime
             perms = (
@@ -318,6 +324,10 @@ class SecurityScanner:
             "policy_decision": policy_decision,
             "regression": regression,
         }
+
+        if enable_runtime and last_runtime_error:
+            result["runtime_error"] = last_runtime_error
+            result["summary"]["runtime_error"] = last_runtime_error
 
         # Persist
         save_scan(scan_id, str(self.skills_root), result, self.db_path)

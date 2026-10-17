@@ -13,13 +13,29 @@ from .event_model import EventGraph
 logger = logging.getLogger(__name__)
 
 
+class RuntimeMonitoringUnavailableError(RuntimeError):
+    """Raised when runtime monitoring is unavailable or untrusted execution is disabled."""
+
+    pass
+
+
+def is_runtime_available() -> bool:
+    """Return True if an isolated runtime execution sandbox is available."""
+    return False
+
+
 def run_isolated(skill_path: Path, timeout: float = 10.0) -> EventGraph:
     """Run skill in isolated sandbox and collect SecurityEvents.
 
     NOTE: Direct subprocess execution of untrusted skill code has been removed.
     A full OS-level sandbox is required before untrusted code can be executed.
     """
-    logger.info("Runtime execution disabled pending OS-level sandbox: %s", skill_path)
+    if not is_runtime_available():
+        raise RuntimeMonitoringUnavailableError(
+            f"Runtime monitoring is unavailable: direct execution of untrusted skill code ({skill_path.name}) "
+            "is disabled pending a real OS-level sandbox."
+        )
+    logger.info("Running isolated execution for: %s", skill_path)
     return EventGraph()
 
 

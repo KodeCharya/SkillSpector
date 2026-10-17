@@ -83,6 +83,8 @@ def load_manifest(skill_path: Path) -> tuple[dict[str, Any], str]:
         skill_path / "skill.yml",
         skill_path / "manifest.yaml",
         skill_path / "manifest.yml",
+        skill_path / "SKILL.md",
+        skill_path / "skill.md",
     ]
     for p in candidates:
         if p.exists():
@@ -90,6 +92,24 @@ def load_manifest(skill_path: Path) -> tuple[dict[str, Any], str]:
                 if p.suffix == ".json":
                     data = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
                     return data, str(p)
+                elif p.suffix == ".md":
+                    text = p.read_text(encoding="utf-8", errors="ignore")
+                    fm_match = re.search(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+                    if fm_match:
+                        fm_text = fm_match.group(1)
+                        try:
+                            import yaml
+
+                            data = yaml.safe_load(fm_text)
+                            return data if isinstance(data, dict) else {}, str(p)
+                        except Exception:
+                            data = {}
+                            for line in fm_text.splitlines():
+                                if ":" in line and not line.strip().startswith("#"):
+                                    k, v = line.split(":", 1)
+                                    data[k.strip()] = v.strip().strip("\"'")
+                            return data, str(p)
+                    return {}, str(p)
                 else:
                     # yaml manual simple parse without dependency
                     text = p.read_text(encoding="utf-8", errors="ignore")
