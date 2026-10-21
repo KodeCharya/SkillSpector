@@ -37,6 +37,7 @@ from typing import Annotated, cast
 from urllib.parse import quote
 
 import typer
+from click.core import ParameterSource
 from langchain_core.runnables import RunnableConfig
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -46,6 +47,7 @@ from rich.tree import Tree
 from skillspector import __version__, transitive
 from skillspector.cleanup import TempDirTracker, cleanup_result
 from skillspector.constants import RISK_THRESHOLD
+from skillspector.file_output import require_secure_file_output, write_text_no_follow
 from skillspector.graph_proxy import graph
 from skillspector.input_handler import validate_local_input_path
 from skillspector.inspection_ledger import (
@@ -57,6 +59,7 @@ from skillspector.inspection_ledger import (
     inspection_work_id,
     ledger_event,
 )
+from skillspector.llm_utils import unsupported_control_error
 from skillspector.logging_config import get_logger, set_level
 from skillspector.mcp_registry import scan_registry
 from skillspector.models import OCCURRENCE_FINDING_ID_KEY, Finding
@@ -67,7 +70,7 @@ from skillspector.multi_skill import (
     detect_skills,
 )
 from skillspector.nodes.analyzers import ANALYZER_MODULES, ANALYZER_NODE_IDS
-from skillspector.nodes.report import report
+from skillspector.nodes.report import report, risk_severity_and_recommendation
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
 from skillspector.semantic_runtime import (
     has_semantic_runtime_event,
@@ -82,8 +85,10 @@ from skillspector.suppression import (
     dump_baseline,
     effective_findings,
     load_baseline,
+    serialize_baseline,
     source_content_key,
 )
+from skillspector.terminal_text import visible_terminal_text as _visible_terminal_text
 
 logger = get_logger(__name__)
 
@@ -352,6 +357,17 @@ def _result_body(result: dict) -> str:
     return report_body
 
 
+def _validate_report_destination(input_path: Path, output: Path | None) -> None:
+    """Reject reports that would overwrite an input, including path aliases."""
+    if (
+        output is not None
+        and input_path.is_file()
+        and output.exists()
+        and output.samefile(input_path)
+    ):
+        raise ValueError("--output points to the input file. Choose a different output path.")
+
+
 def _write_result(
     result: dict[str, object],
     output: Path | None,
@@ -360,16 +376,26 @@ def _write_result(
     """Write report_body to file or stdout. Uses sarif_report if report_body missing."""
     report_body = _result_body(result)
     if output:
-        Path(output).write_text(report_body, encoding="utf-8")
+        write_text_no_follow(output, report_body)
         if format == FormatChoice.terminal:
             console.print(f"\n[green]Report saved to:[/green] {output}")
         else:
             console.print(f"Report saved to: {output}")
     else:
         if format == FormatChoice.terminal:
-            console.print(report_body, markup=False)
+            console.print(report_body, markup=False, emoji=False)
         else:
             print(report_body)
+
+
+def _exit_on_unsupported_llm_controls(no_llm: bool) -> None:
+    """Exit 2 before any analysis when a configured model rejects a requested control."""
+    if no_llm:
+        return
+    error = unsupported_control_error()
+    if error is not None:
+        err_console.print(f"[red]Error:[/red] {error}")
+        raise typer.Exit(code=2)
 
 
 def _validate_min_coverage(value: float | None) -> float | None:
@@ -449,6 +475,7 @@ def _multi_skill_limitation_events(
 
 @app.command()
 def scan(
+    ctx: typer.Context,
     input_path: Annotated[
         str,
         typer.Argument(
@@ -527,7 +554,8 @@ def scan(
             "directory (.skillspector-baseline.yaml). Off by default: a skill "
             "author's baseline can suppress findings in your scan, so a discovered "
             "baseline is only reported until you opt in. Ignored when --baseline "
-            "is given.",
+            "is given. Not supported for recursive multi-skill scans; scan each "
+            "sub-skill separately.",
         ),
     ] = False,
     transitive_enabled: Annotated[
@@ -667,6 +695,13 @@ def scan(
         )
         raise typer.Exit(code=2)
 
+    if output is not None:
+        try:
+            require_secure_file_output()
+        except ValueError as exc:
+            err_console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(code=2) from exc
+
     if mcp_registry:
         if (
             recursive
@@ -674,11 +709,18 @@ def scan(
             or show_suppressed
             or yara_rules_dir is not None
             or min_coverage is not None
+            or use_shipped_baseline
+            or transitive_enabled
+            or transitive_allow_prefix
+            or transitive_deny_prefix
+            # Even an explicitly supplied default depth requests an unsupported option.
+            or ctx.get_parameter_source("transitive_depth") not in (None, ParameterSource.DEFAULT)
         ):
             err_console.print(
                 "[red]Error:[/red] --mcp-registry cannot be combined with "
                 "--recursive, --baseline, --show-suppressed, --yara-rules-dir, "
-                "or --min-coverage"
+                "--min-coverage, --use-shipped-baseline, --transitive, "
+                "--transitive-depth, --transitive-allow-prefix, or --transitive-deny-prefix"
             )
             raise typer.Exit(code=2)
         if format != FormatChoice.json:
@@ -687,6 +729,9 @@ def scan(
             )
             raise typer.Exit(code=2)
         try:
+            _validate_report_destination(Path(input_path), output)
+            if mcp_registry_compare is not None:
+                _validate_report_destination(mcp_registry_compare, output)
             result = (
                 scan_registry(input_path, compare_path=mcp_registry_compare)
                 if mcp_registry_compare is not None
@@ -694,7 +739,7 @@ def scan(
             )
             report = json.dumps(result, indent=2)
             if output:
-                output.write_text(report, encoding="utf-8")
+                write_text_no_follow(output, report)
                 console.print(f"Report saved to: {output}")
             else:
                 print(report)
@@ -716,15 +761,7 @@ def scan(
     if not input_path.startswith(("http://", "https://", "git@")):
         try:
             resolved_path = validate_local_input_path(resolved_path)
-            if (
-                output is not None
-                and resolved_path.is_file()
-                and output.exists()
-                and output.samefile(resolved_path)
-            ):
-                raise ValueError(
-                    "--output points to the input file. Choose a different output path."
-                )
+            _validate_report_destination(resolved_path, output)
         except (OSError, ValueError) as e:
             err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=2) from e
@@ -735,6 +772,7 @@ def scan(
     except ValueError as exc:
         err_console.print(f"[red]Error:[/red] invalid transitive prefix: {exc}")
         raise typer.Exit(code=2) from exc
+    _exit_on_unsupported_llm_controls(no_llm)
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     pre_scan_ledger_events: list[dict[str, object]] = []
     discovery_console = (
@@ -755,6 +793,12 @@ def scan(
                 err_console.print(
                     "[red]Error:[/red] --baseline is not supported for recursive "
                     "multi-skill scans; scan each sub-skill with its own baseline"
+                )
+                raise typer.Exit(code=2)
+            if use_shipped_baseline:
+                err_console.print(
+                    "[red]Error:[/red] --use-shipped-baseline is not supported for recursive "
+                    "multi-skill scans; scan each sub-skill separately with --use-shipped-baseline"
                 )
                 raise typer.Exit(code=2)
             # Same error contract as the single-skill scan below: an error that
@@ -1470,23 +1514,6 @@ def _cache_transitive_result(
         meta_review_required=child_result.get("meta_review_required") is True,
         refs=extraction.references,
     )
-
-
-def _visible_terminal_text(value: str) -> str:
-    """Render untrusted path text without passing terminal control characters."""
-    visible: list[str] = []
-    for character in value:
-        if character.isprintable():
-            visible.append(character)
-            continue
-        codepoint = ord(character)
-        if codepoint <= 0xFF:
-            visible.append(f"\\x{codepoint:02x}")
-        elif codepoint <= 0xFFFF:
-            visible.append(f"\\u{codepoint:04x}")
-        else:
-            visible.append(f"\\U{codepoint:08x}")
-    return "".join(visible)
 
 
 def _discovered_files_tree(paths: list[str]) -> Tree:
@@ -2736,21 +2763,11 @@ def _multi_skill_risk_assessment(
     analysis_incomplete: bool,
 ) -> dict[str, object]:
     """Return bounded aggregate risk evidence independent of child retention."""
-    if max_score >= 81:
-        severity = "CRITICAL"
-    elif max_score >= 51:
-        severity = "HIGH"
-    elif max_score >= 21:
-        severity = "MEDIUM"
-    else:
-        severity = "LOW"
-    recommendation = (
-        "DO_NOT_INSTALL"
-        if execution_failed or max_score > RISK_THRESHOLD
-        else "CAUTION"
-        if analysis_incomplete
-        else "SAFE"
-    )
+    severity, recommendation = risk_severity_and_recommendation(max_score)
+    if execution_failed:
+        recommendation = "DO_NOT_INSTALL"
+    elif analysis_incomplete and recommendation == "SAFE":
+        recommendation = "CAUTION"
     return {
         "max_risk_score": max_score,
         "severity": severity,
@@ -3274,7 +3291,7 @@ def _scan_multi_skill(
             rendered = json.dumps(combined, indent=2)
         _ensure_recursive_output_bound(rendered)
         if output is not None:
-            Path(output).write_text(rendered, encoding="utf-8")
+            write_text_no_follow(output, rendered)
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
             sys.stdout.write(rendered)
@@ -3302,7 +3319,7 @@ def _scan_multi_skill(
             rendered = json.dumps(merged_sarif, indent=2)
         _ensure_recursive_output_bound(rendered)
         if output is not None:
-            Path(output).write_text(rendered, encoding="utf-8")
+            write_text_no_follow(output, rendered)
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         else:
             sys.stdout.write(rendered)
@@ -3335,10 +3352,10 @@ def _scan_multi_skill(
             )
         _ensure_recursive_output_bound(rendered)
         if output is not None:
-            Path(output).write_text(rendered, encoding="utf-8")
+            write_text_no_follow(output, rendered)
             progress_console.print(f"[green]Combined report saved to:[/green] {output}")
         elif format is FormatChoice.terminal:
-            console.print(rendered)
+            console.print(rendered, markup=False, emoji=False)
         else:
             sys.stdout.write(rendered)
 
@@ -3416,7 +3433,7 @@ def baseline(
         typer.Option(
             "--output",
             "-o",
-            help="Where to write the baseline file (YAML; .json extension writes JSON).",
+            help="Baseline file (YAML; .json writes JSON), or - for JSON on stdout.",
         ),
     ] = Path(".skillspector-baseline.yaml"),
     no_llm: Annotated[
@@ -3450,14 +3467,19 @@ def baseline(
         skillspector baseline ./my-skill/ -o team-baseline.yaml --no-llm
         skillspector scan ./my-skill/ --baseline .skillspector-baseline.yaml
     """
+    _exit_on_unsupported_llm_controls(no_llm)
     result = None
     try:
+        to_stdout = str(output) == "-"
+        if not to_stdout:
+            require_secure_file_output()
         if verbose:
             set_level("DEBUG")
-            console.print("[dim]Scanning to build baseline...[/dim]")
+            err_console.print("[dim]Scanning to build baseline...[/dim]")
         # output_format is irrelevant here; we consume findings, not report_body.
         state = _scan_state(input_path, FormatChoice.json, no_llm)
-        state["baseline_path"] = os.path.abspath(output.expanduser())
+        if not to_stdout:
+            state["baseline_path"] = os.path.abspath(output.expanduser())
         result = graph.invoke(state)
         completeness_value = result.get("analysis_completeness")
         completeness = completeness_value if isinstance(completeness_value, dict) else {}
@@ -3488,10 +3510,13 @@ def baseline(
             file_cache=result.get("local_file_cache") or result.get("file_cache") or {},
             scanner_version=__version__,
         )
-        dump_baseline(data, output)
-        console.print(
-            f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
-        )
+        if to_stdout:
+            sys.stdout.write(serialize_baseline(data, json_output=True) + "\n")
+        else:
+            dump_baseline(data, output)
+            console.print(
+                f"[green]Wrote baseline with {len(findings)} suppressed finding(s) to:[/green] {output}"
+            )
     except typer.Exit:
         raise
     except (FileNotFoundError, ValueError) as e:
