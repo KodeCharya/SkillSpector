@@ -66,10 +66,18 @@ class GapFillFinding(BaseModel):
 
     rule_id: str = Field(description="Identifier matching one of the gap-fill rule IDs")
     message: str = Field(description="Short description of the finding")
-    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(description="Severity level")
-    confidence: float = Field(ge=0.0, le=1.0, default=0.7, description="Confidence score (0.0-1.0)")
-    explanation: str = Field(default="", description="Why this is dangerous (2-3 sentences)")
-    remediation: str = Field(default="", description="Actionable steps to fix the issue")
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = Field(
+        description="Severity level"
+    )
+    confidence: float = Field(
+        ge=0.0, le=1.0, default=0.7, description="Confidence score (0.0-1.0)"
+    )
+    explanation: str = Field(
+        default="", description="Why this is dangerous (2-3 sentences)"
+    )
+    remediation: str = Field(
+        default="", description="Actionable steps to fix the issue"
+    )
 
     def to_finding(self, file: str) -> Finding:
         """Convert to a :class:`~skillspector.models.Finding` for the report."""
@@ -198,7 +206,6 @@ class GapFillAnalyzer(LLMAnalyzerBase):
         # Wire multi-key pool into gap-fill LLM calls
         if api_pool:
             from .api_pool import PooledChatModel
-
             self.chat_model = PooledChatModel(api_pool)
 
     # -- Prompt ---------------------------------------------------------------
@@ -222,38 +229,10 @@ class GapFillAnalyzer(LLMAnalyzerBase):
         validate with :class:`GapFillResult`, and filter to ``confidence >= 0.7``.
         Invalid JSON or schema raises ``_StructuredResponseValidationError`` for retry.
         """
-        text = str(response).strip()
-
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            first_nl = text.find("\n")
-            if first_nl != -1:
-                text = text[first_nl + 1 :]
-            if text.rstrip().endswith("```"):
-                text = text.rstrip()[:-3].rstrip()
-
-        # Parse JSON → Pydantic for validation
-        import json
-
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            logger.warning(
-                "GapFillAnalyzer: invalid JSON for %s: %s",
-                batch.file_label,
-                exc,
-            )
-            return []
-
-        try:
-            result = GapFillResult.model_validate(data)
-        except Exception as exc:
-            logger.warning(
-                "GapFillAnalyzer: schema validation failed for %s: %s",
-                batch.file_label,
-                exc,
-            )
-            return []
+        if isinstance(response, GapFillResult):
+            result = response
+        else:
+            result = self._parse_json_response(response)
 
         findings: list[Finding] = []
         for item in result.findings:
@@ -299,7 +278,9 @@ def run_gap_fill(
     file_cache: dict[str, str],
     language: str,
     model: str | None = None,
-    api_pool: ApiKeyPool | None = None,
+    api_pool: "ApiKeyPool | None" = None,
+    *,
+    timeout: float | None | Callable[[], float | None] = None,
 ) -> list[Finding]:
     """Run a single targeted LLM pass covering the 8 gap-fill rules.
 

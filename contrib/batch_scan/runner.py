@@ -41,10 +41,12 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from skillspector.graph import graph
+from skillspector.inspection_ledger import finalize_ledger
 from skillspector.llm_analyzer_base import (
     LLMAnalyzerBase,
     LLMAnalysisResult,
     _StructuredResponseValidationError,
+    ledger_events_for_batches,
 )
 from skillspector.logging_config import get_logger
 from skillspector.nodes.meta_analyzer import LLMMetaAnalyzer, MetaAnalyzerResult
